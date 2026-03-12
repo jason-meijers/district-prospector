@@ -102,6 +102,9 @@ class Settings(BaseSettings):
     max_directory_pages: int = 2  # extra pagination pages to fetch per staff-directory-like URL
     claude_model: str = "claude-sonnet-4-20250514"
 
+    # Optional: require this secret on /webhook/pipedrive (header X-Webhook-Secret or query ?secret=)
+    webhook_secret: str | None = None
+
     class Config:
         env_file = ".env"
 

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.config import (
@@ -362,8 +363,20 @@ async def pipedrive_webhook(request: Request, background_tasks: BackgroundTasks)
     Receives Pipedrive organization update webhooks.
     Checks if the trigger field was toggled, then runs the pipeline
     in the background.
+    If WEBHOOK_SECRET is set, requests must include it via header
+    X-Webhook-Secret or query param ?secret=...
     """
     settings = get_settings()
+
+    # Optional auth: require shared secret if configured
+    if settings.webhook_secret:
+        header_secret = request.headers.get("X-Webhook-Secret")
+        query_secret = request.query_params.get("secret")
+        if header_secret != settings.webhook_secret and query_secret != settings.webhook_secret:
+            return JSONResponse(
+                content={"status": "unauthorized", "reason": "invalid or missing webhook secret"},
+                status_code=401,
+            )
 
     try:
         body = await request.json()
