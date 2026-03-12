@@ -380,7 +380,9 @@ async def pipedrive_webhook(request: Request, background_tasks: BackgroundTasks)
 
     try:
         body = await request.json()
+        print("[webhook] raw body:", body)
     except Exception:
+        print("[webhook] invalid JSON payload")
         return {"status": "ignored", "reason": "invalid JSON"}
 
     # Pipedrive webhooks have different structures depending on the event
@@ -390,6 +392,7 @@ async def pipedrive_webhook(request: Request, background_tasks: BackgroundTasks)
 
     # Only process organization updates
     if meta.get("object") != "organization":
+        print("[webhook] ignored: not an organization event, meta:", meta)
         return {"status": "ignored", "reason": "not an organization event"}
 
     # Check if the trigger field changed to the "Trigger" option (ID 632)
@@ -403,16 +406,24 @@ async def pipedrive_webhook(request: Request, background_tasks: BackgroundTasks)
     previous_str = str(previous_value) if previous_value is not None else ""
 
     if current_str != trigger_id:
+        print(
+            "[webhook] ignored: trigger field not set to Trigger",
+            "current:", current_value,
+            "previous:", previous_value,
+        )
         return {"status": "ignored", "reason": "trigger field not set to Trigger"}
 
     if current_str == previous_str:
+        print("[webhook] ignored: trigger field unchanged")
         return {"status": "ignored", "reason": "trigger field unchanged"}
 
     org_id = current.get("id")
     if not org_id:
+        print("[webhook] error: no org ID found in current:", current)
         return {"status": "error", "reason": "no org ID found"}
 
     # Run in background so we return 200 immediately
+    print(f"[webhook] accepted: starting pipeline for org {org_id}")
     background_tasks.add_task(run_research_pipeline, org_id)
 
     return {"status": "accepted", "org_id": org_id}
