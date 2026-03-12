@@ -189,10 +189,16 @@ class PipedriveClient:
     def get_org_website(self, org_data: dict) -> str | None:
         """
         Extract the district website URL from the org record.
-        Checks the built-in Pipedrive 'url' field first, then falls back
-        to the custom website field.
+        Checks the built-in Pipedrive 'website' field first, then falls back
+        to the custom website field (PIPEDRIVE_WEBSITE_FIELD_KEY).  Some
+        accounts may also use a legacy 'url' field, so we include that as a
+        final fallback.
         """
-        url = org_data.get("url") or org_data.get(PIPEDRIVE_WEBSITE_FIELD_KEY)
+        url = (
+            org_data.get("website")
+            or org_data.get("url")
+            or org_data.get(PIPEDRIVE_WEBSITE_FIELD_KEY)
+        )
         if url and not url.startswith("http"):
             url = f"https://{url}"
         return url or None
