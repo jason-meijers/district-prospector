@@ -386,18 +386,43 @@ async def pipedrive_webhook(request: Request, background_tasks: BackgroundTasks)
         return {"status": "ignored", "reason": "invalid JSON"}
 
     # Pipedrive webhooks have different structures depending on the event
-    current = body.get("current", {})
-    previous = body.get("previous", {})
-    meta = body.get("meta", {})
+    # Support both the older shape {current, previous, meta.object}
+    # and the v2 shape {data, previous, meta.entity, data.custom_fields}.
+    meta = body.get("meta", {}) or {}
+
+    if "data" in body:
+        # v2 style payload (what we're currently seeing in logs)
+        data = body.get("data") or {}
+        previous = body.get("previous") or {}
+        data_custom = data.get("custom_fields") or {}
+        prev_custom = previous.get("custom_fields") or {}
+        current_value_raw = data_custom.get(PIPEDRIVE_TRIGGER_FIELD_KEY)
+        previous_value_raw = prev_custom.get(PIPEDRIVE_TRIGGER_FIELD_KEY)
+        org_id = data.get("id")
+        object_type = meta.get("entity")
+    else:
+        # legacy style payload
+        current = body.get("current", {}) or {}
+        previous = body.get("previous", {}) or {}
+        current_value_raw = current.get(PIPEDRIVE_TRIGGER_FIELD_KEY)
+        previous_value_raw = previous.get(PIPEDRIVE_TRIGGER_FIELD_KEY)
+        org_id = current.get("id")
+        object_type = meta.get("object")
 
     # Only process organization updates
-    if meta.get("object") != "organization":
+    if object_type != "organization":
         print("[webhook] ignored: not an organization event, meta:", meta)
         return {"status": "ignored", "reason": "not an organization event"}
 
+    def _extract_option_id(value):
+        """Pipedrive may send dropdowns as plain IDs or {id, type} objects."""
+        if isinstance(value, dict) and "id" in value:
+            return value.get("id")
+        return value
+
     # Check if the trigger field changed to the "Trigger" option (ID 632)
-    current_value = current.get(PIPEDRIVE_TRIGGER_FIELD_KEY)
-    previous_value = previous.get(PIPEDRIVE_TRIGGER_FIELD_KEY)
+    current_value = _extract_option_id(current_value_raw)
+    previous_value = _extract_option_id(previous_value_raw)
 
     # Only trigger when the dropdown is set to "Trigger" (option ID 632)
     # Pipedrive sends dropdown values as strings or ints depending on context
@@ -408,8 +433,8 @@ async def pipedrive_webhook(request: Request, background_tasks: BackgroundTasks)
     if current_str != trigger_id:
         print(
             "[webhook] ignored: trigger field not set to Trigger",
-            "current:", current_value,
-            "previous:", previous_value,
+            "current:", current_value_raw,
+            "previous:", previous_value_raw,
         )
         return {"status": "ignored", "reason": "trigger field not set to Trigger"}
 
@@ -417,9 +442,8 @@ async def pipedrive_webhook(request: Request, background_tasks: BackgroundTasks)
         print("[webhook] ignored: trigger field unchanged")
         return {"status": "ignored", "reason": "trigger field unchanged"}
 
-    org_id = current.get("id")
     if not org_id:
-        print("[webhook] error: no org ID found in current:", current)
+        print("[webhook] error: no org ID found, meta/body:", meta, body)
         return {"status": "error", "reason": "no org ID found"}
 
     # Run in background so we return 200 immediately
