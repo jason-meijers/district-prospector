@@ -187,14 +187,16 @@ class SlackClient:
         if switch_info:
             deal_ids = ", ".join(str(d["deal_id"]) for d in switch_info["deals"])
             deal_names = ", ".join(d["title"] or f"Deal #{d['deal_id']}" for d in switch_info["deals"])
+            old_role_label = switch_info.get("old_role_label") or "Unknown"
+            new_role_label = switch_info.get("new_role_label") or role_label
             switch_note = (
-                f"Prospecting Bot: {contact['name']} replaced {switch_info['old_name']} "
-                f"as {switch_info['role_label']} at {switch_info['org_name']}. "
+                f"Prospecting Bot: {switch_info['old_name']} no longer appears to be at the district. "
+                f"Replacing {switch_info['old_name']} ({old_role_label}) with {contact['name']} ({new_role_label}). "
                 f"Deal point of contact updated on {switch_info['date_str']}."
             )
             msg += (
                 f"\n\n*Action: Switch Point of Contact*\n"
-                f"Replaces: {switch_info['old_name']}\n"
+                f"Replaces: {switch_info['old_name']} ({old_role_label}) → {contact['name']} ({new_role_label})\n"
                 f"📁 Deals: {deal_names}\n"
                 f"Deal ID(s): {deal_ids}\n"
                 f"--Switch Note Start--\n"
@@ -283,8 +285,9 @@ class SlackClient:
     def format_switch_contact(
         self,
         old_name: str,
+        old_role_label: str,
         new_name: str,
-        role_label: str,
+        new_role_label: str,
         deals: list[dict],
         new_person_id: int,
         org_name: str,
@@ -297,13 +300,13 @@ class SlackClient:
         body_json = json.dumps(body, indent=2)
 
         note_content = (
-            f"Prospecting Bot: {new_name} replaced {old_name} as {role_label} "
-            f"at {org_name}. Deal point of contact updated on {date_str}."
+            f"Prospecting Bot: {old_name} no longer appears to be at the district. "
+            f"Replacing {old_name} ({old_role_label}) with {new_name} ({new_role_label}). "
+            f"Deal point of contact updated on {date_str}."
         )
 
         return (
-            f"🔄 *SWITCH: {new_name} for {old_name}*\n"
-            f"📋 Role: {role_label}\n"
+            f"🔄 *SWITCH: {new_name} ({new_role_label}) for {old_name} ({old_role_label})*\n"
             f"📁 Deals: {deal_names}\n\n"
             f"*Action: Switch Point of Contact*\n"
             f"Deal ID(s): {deal_ids}\n"

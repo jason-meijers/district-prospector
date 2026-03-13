@@ -212,10 +212,15 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
                             or "N/A"
                         )
 
+                        old_role_label = (
+                            ROLE_CATEGORY_OPTIONS.get(old_role_id) or "Unknown"
+                        )
+
                         if best.get("_is_new"):
                             new_switch_map[best.get("name", "")] = {
                                 "old_name": old_name,
-                                "role_label": best_role_label,
+                                "old_role_label": old_role_label,
+                                "new_role_label": best_role_label,
                                 "deals": affected_deals,
                                 "org_name": org_name,
                                 "date_str": date_str,
@@ -228,8 +233,9 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
                         else:
                             existing_switch_queue.append({
                                 "old_name": old_name,
+                                "old_role_label": old_role_label,
                                 "new_name": best.get("name") or "Unknown",
-                                "role_label": best_role_label,
+                                "new_role_label": best_role_label,
                                 "deals": affected_deals,
                                 "new_person_id": best["pipedrive_person_id"],
                             })
@@ -294,8 +300,9 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         for switch in existing_switch_queue:
             msg = slack.format_switch_contact(
                 old_name=switch["old_name"],
+                old_role_label=switch["old_role_label"],
                 new_name=switch["new_name"],
-                role_label=switch["role_label"],
+                new_role_label=switch["new_role_label"],
                 deals=switch["deals"],
                 new_person_id=switch["new_person_id"],
                 org_name=org_name,
