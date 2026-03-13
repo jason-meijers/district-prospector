@@ -79,6 +79,20 @@ async def fetch_page(url: str, timeout: int = 15) -> str | None:
             return resp.text
     except Exception as e:
         print(f"[scraper] Failed to fetch {url}: {e}")
+
+        # Some districts silently drop plain HTTP connections but work over HTTPS.
+        # If the original URL was http://, automatically retry once with https://.
+        if url.startswith("http://"):
+            https_url = "https://" + url[len("http://") :]
+            try:
+                print(f"[scraper] Retrying over HTTPS: {https_url}")
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                    resp = await client.get(https_url, headers=headers)
+                    resp.raise_for_status()
+                    return resp.text
+            except Exception as e_https:
+                print(f"[scraper] HTTPS retry also failed for {https_url}: {e_https}")
+
         return None
 
 
