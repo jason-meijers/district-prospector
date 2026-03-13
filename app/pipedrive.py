@@ -97,6 +97,9 @@ class PipedriveClient:
                 custom_fields.get(PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY)
                 or p.get(PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY)
             )
+            # Pipedrive may return enum fields as {id, type} dicts in v2 responses
+            if isinstance(role_id, dict):
+                role_id = role_id.get("id")
             try:
                 role_id_int = int(role_id) if role_id is not None else None
             except (TypeError, ValueError):
