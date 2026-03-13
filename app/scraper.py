@@ -63,37 +63,46 @@ def _annotate_phone_numbers(text: str) -> str:
     return "".join(result)
 
 
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
 async def fetch_page(url: str, timeout: int = 15) -> str | None:
-    """Fetch a page and return raw HTML, or None on failure."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            return resp.text
-    except Exception as e:
-        print(f"[scraper] Failed to fetch {url}: {e}")
+    """
+    Fetch a page and return raw HTML, or None on failure.
 
-        # Some districts silently drop plain HTTP connections but work over HTTPS.
-        # If the original URL was http://, automatically retry once with https://.
-        if url.startswith("http://"):
-            https_url = "https://" + url[len("http://") :]
-            try:
-                print(f"[scraper] Retrying over HTTPS: {https_url}")
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                    resp = await client.get(https_url, headers=headers)
-                    resp.raise_for_status()
-                    return resp.text
-            except Exception as e_https:
-                print(f"[scraper] HTTPS retry also failed for {https_url}: {e_https}")
+    Retry strategy:
+    1. Normal browser UA.
+    2. If HTTP and the server disconnects, retry with HTTPS.
+    3. If the page loads but is nearly empty (JS-rendered shell), retry with a
+       crawler UA — many platforms (e.g. SchoolBlocks) serve pre-rendered HTML
+       to bots/crawlers for SEO even though browsers get a JS shell.
+    """
+    async def _get(target_url: str, ua: str) -> str | None:
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                resp = await client.get(target_url, headers={"User-Agent": ua})
+                resp.raise_for_status()
+                return resp.text
+        except Exception as e:
+            print(f"[scraper] Failed to fetch {target_url}: {e}")
+            return None
 
-        return None
+    html = await _get(url, _BROWSER_UA)
+
+    # HTTPS upgrade retry for plain-HTTP URLs that drop connections
+    if html is None and url.startswith("http://"):
+        https_url = "https://" + url[len("http://"):]
+        print(f"[scraper] Retrying over HTTPS: {https_url}")
+        html = await _get(https_url, _BROWSER_UA)
+        if html is None:
+            print(f"[scraper] HTTPS retry also failed for {https_url}")
+            return None
+
+    return html
 
 
 def _extract_ssr_content(soup: BeautifulSoup) -> str:
@@ -228,6 +237,24 @@ def clean_html(raw_html: str) -> str:
     """
     soup = BeautifulSoup(raw_html, "html.parser")
 
+    # ── Phase 0: SchoolBlocks person block extraction ────────────
+    # SchoolBlocks sites render staff cards via JS but embed name+title in
+    # data-filter-string / aria-label attributes on data-blocktype="person"
+    # elements.  Extract those before the rest of the HTML is cleaned away.
+    sb_lines: list[str] = []
+    for person_el in soup.find_all(attrs={"data-blocktype": "person"}):
+        filter_str = person_el.get("data-filter-string") or person_el.get("aria-label") or ""
+        if filter_str.strip():
+            sb_lines.append(filter_str.strip())
+        # Also grab any mailto links inside the block
+        for a in person_el.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("mailto:"):
+                email = href[len("mailto:"):]
+                if email:
+                    sb_lines.append(f"Email: {email}")
+    sb_text = "\n".join(sb_lines)
+
     # ── Phase 1: Extract content from SSR / JS-framework data blocks
     #    BEFORE we strip <script> tags, because the actual page content
     #    may live entirely inside those blocks.
@@ -264,10 +291,9 @@ def clean_html(raw_html: str) -> str:
 
     html_text = "\n".join(deduped)
 
-    # ── Phase 3: Combine SSR content + standard HTML ────────────
-    # Put SSR content first (it's usually the actual page body);
-    # append standard HTML after in case it has additional info.
-    parts = [p for p in (ssr_text, html_text) if p.strip()]
+    # ── Phase 3: Combine SchoolBlocks + SSR content + standard HTML ─
+    # SchoolBlocks person blocks go first; SSR content second; HTML last.
+    parts = [p for p in (sb_text, ssr_text, html_text) if p.strip()]
     combined = "\n".join(parts)
 
     # ── Phase 4: Strip UI widget label lines ─────────────────────
