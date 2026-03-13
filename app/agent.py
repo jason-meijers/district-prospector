@@ -303,6 +303,41 @@ class ExtractionAgent:
 
         return None
 
+    # Common staff/leadership directory paths used by various school website platforms.
+    # These are probed and prepended when the site's links don't include human-readable
+    # staff pages (e.g. SchoolBlocks sites that only expose UUID-based internal links).
+    _COMMON_STAFF_PATHS = [
+        "/en-US/staff",
+        "/staff",
+        "/staff-directory",
+        "/about/staff-directory",
+        "/district/staff-directory",
+        "/district/staff",
+        "/departments/staff-directory",
+        "/pages/staff-directory",
+        "/about-us/staff-directory",
+        "/our-district/staff",
+        "/contact/staff-directory",
+    ]
+
+    async def _probe_common_staff_urls(self, base_url: str) -> list[str]:
+        """
+        Probe a fixed set of common staff directory paths against the base URL.
+        Returns only paths that actually respond with enough content to be useful.
+        Uses a short timeout so it doesn't slow down sites that 404 cleanly.
+        """
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        found = []
+        for path in self._COMMON_STAFF_PATHS:
+            url = origin + path
+            html = await fetch_page(url, timeout=8)
+            if html and len(html) > 500:
+                found.append(url)
+                print(f"[agent] Found common staff path: {url}")
+        return found
+
     async def identify_subpages(self, homepage_html: str, base_url: str) -> list[str]:
         """
         Step 3: Use heuristic pre-filtering + Claude to identify the best
@@ -326,6 +361,8 @@ class ExtractionAgent:
         system = URL_IDENTIFICATION_SYSTEM.format(max_urls=self.settings.max_subpages)
 
         raw = None
+        claude_urls: list[str] = []
+        _usage: dict = {}
         try:
             raw, _usage = self._call_claude(system, user_message, max_tokens=1024)
             if raw is None:
@@ -335,19 +372,29 @@ class ExtractionAgent:
             cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             urls = json.loads(cleaned)
             if isinstance(urls, list):
-                return urls[: self.settings.max_subpages], _usage
-            if isinstance(urls, dict):
-                # Claude sometimes returns {"urls": [...]}
+                claude_urls = urls
+            elif isinstance(urls, dict):
                 list_urls = urls.get("urls") or urls.get("url") or []
                 if isinstance(list_urls, list):
-                    return list_urls[: self.settings.max_subpages], _usage
-            # urls may be None (JSON null) or another type — fall through to fallback
+                    claude_urls = list_urls
         except (json.JSONDecodeError, Exception) as e:
             print(f"[agent] URL identification failed: {e}")
             print(f"[agent] Raw response was: {raw[:500] if raw else 'None'}")
+            claude_urls = candidate_urls  # fallback
 
-        # Fallback: use top heuristic candidates
-        return candidate_urls[: self.settings.max_subpages], {}
+        # If Claude only returned UUID/opaque paths, the site likely uses a JS framework
+        # (e.g. SchoolBlocks) that hides human-readable URLs from its HTML.
+        # Probe common staff directory paths and prepend any that respond.
+        import re as _re
+        uuid_pattern = _re.compile(r"/pages/[0-9a-f-]{8,}", _re.IGNORECASE)
+        all_opaque = claude_urls and all(uuid_pattern.search(u) for u in claude_urls)
+        if all_opaque or not claude_urls:
+            print("[agent] All candidate URLs appear UUID-based — probing common staff paths...")
+            common = await self._probe_common_staff_urls(base_url)
+            # Prepend found common paths; keep Claude's UUIDs as fallback
+            claude_urls = common + [u for u in claude_urls if u not in common]
+
+        return claude_urls[: self.settings.max_subpages], _usage
 
     async def fetch_and_clean_pages(
         self, base_url: str, subpage_urls: list[str]
