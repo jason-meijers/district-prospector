@@ -115,7 +115,7 @@ class SlackClient:
             f"• Total: {total:,}"
         )
 
-    def format_new_contact(self, contact: dict, org_id: int, date_str: str) -> str:
+    def format_new_contact(self, contact: dict, org_id: int, date_str: str, switch_info: dict | None = None) -> str:
         role_field_key = PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY
         email_display = f"{contact['email']} _({contact['email_confidence']} confidence)_" if contact.get("email") else "Not found"
         phone_display = contact.get("phone") or "Not found"
@@ -163,8 +163,11 @@ class SlackClient:
         source_line = f"📄 Source: <{source_url}|View page>" if source_url else "📄 Source: N/A"
         person_body_json = json.dumps(body, indent=2)
         role_label = contact.get("role_category_label") or contact.get("role_category") or "N/A"
-        return (
-            f"🆕 *CREATE: {contact['name']}*\n"
+
+        header = f"🆕🔄 *CREATE & SWITCH: {contact['name']}*" if switch_info else f"🆕 *CREATE: {contact['name']}*"
+
+        msg = (
+            f"{header}\n"
             f"📋 Title: {contact['job_title']}\n"
             f"🏷️ Role Category: {role_label}\n"
             f"📧 Email: {email_display}\n"
@@ -180,6 +183,26 @@ class SlackClient:
             f"```\n{note_content}\n```\n"
             f"--Note End--"
         )
+
+        if switch_info:
+            deal_ids = ", ".join(str(d["deal_id"]) for d in switch_info["deals"])
+            deal_names = ", ".join(d["title"] or f"Deal #{d['deal_id']}" for d in switch_info["deals"])
+            switch_note = (
+                f"Prospecting Bot: {contact['name']} replaced {switch_info['old_name']} "
+                f"as {switch_info['role_label']} at {switch_info['org_name']}. "
+                f"Deal point of contact updated on {switch_info['date_str']}."
+            )
+            msg += (
+                f"\n\n*Action: Switch Point of Contact*\n"
+                f"Replaces: {switch_info['old_name']}\n"
+                f"📁 Deals: {deal_names}\n"
+                f"Deal ID(s): {deal_ids}\n"
+                f"--Switch Note Start--\n"
+                f"```\n{switch_note}\n```\n"
+                f"--Switch Note End--"
+            )
+
+        return msg
 
     def format_updated_contact(self, contact: dict, date_str: str) -> str:
         changes_display = "\n".join(
