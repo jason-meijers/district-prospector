@@ -261,7 +261,7 @@ class SlackClient:
     def format_former_on_deals(self, contact: dict, deals: list[dict], pipedrive_domain: str) -> str:
         name = contact.get("name") or "Unknown"
         deal_lines = "\n".join(
-            f"• <https://{pipedrive_domain}/deal/{d['deal_id']}|{d['title'] or f'Deal #{d[\"deal_id\"]}'}>"
+            f"• <https://{pipedrive_domain}/deal/{d['deal_id']}|{d['title'] or 'Deal #' + str(d['deal_id'])}>"
             for d in deals
         )
         count = len(deals)
