@@ -16,7 +16,6 @@ from app.config import (
     PIPEDRIVE_EMAIL_DOMAIN_FIELD_KEY,
     PIPEDRIVE_LAST_RESEARCHED_FIELD_KEY,
     ROLE_CATEGORY_OPTIONS,
-    ROLE_PRIORITY,
 )
 from app.pipedrive import PipedriveClient
 from app.slack import SlackClient
@@ -139,114 +138,6 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
 
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        # ── Pre-compute deal switch assignments ────────────────
-        # Do this before posting so NEW contacts can carry switch info inline,
-        # while confirmed/updated replacements get a separate switch message.
-        # new_switch_map: new contact name → switch info dict
-        # existing_switch_queue: list of switch dicts for already-existing contacts
-        new_switch_map: dict[str, dict] = {}
-        existing_switch_queue: list[dict] = []
-
-        if missing:
-            try:
-                org_deals = await pipedrive.get_org_deals(org_id, status="open")
-                print(f"[pipeline] Found {len(org_deals)} open deals for {org_name}")
-
-                missing_person_ids: set[int] = set()
-                missing_by_pid: dict[int, dict] = {}
-                for m in missing:
-                    pid = m.get("pipedrive_person_id")
-                    if pid:
-                        missing_person_ids.add(pid)
-                        missing_by_pid[pid] = m
-
-                deals_by_missing_pid: dict[int, list[dict]] = {}
-                for deal in org_deals:
-                    dpid = deal.get("person_id")
-                    if dpid and dpid in missing_person_ids:
-                        deals_by_missing_pid.setdefault(dpid, []).append(deal)
-
-                if deals_by_missing_pid:
-                    priority_index = {rid: i for i, rid in enumerate(ROLE_PRIORITY)}
-                    fallback = len(ROLE_PRIORITY)
-
-                    def _candidate_sort_key(c: dict, target_role_id: int | None) -> tuple:
-                        cid = c.get("role_category_id")
-                        same_role = 0 if cid == target_role_id else 1
-                        prio = priority_index.get(cid, fallback)
-                        return (same_role, prio)
-
-                    # Full candidate pool: confirmed + updated (existing) + new
-                    all_candidates: list[dict] = []
-                    for c in confirmed:
-                        if c.get("pipedrive_person_id") and c.get("role_category_id"):
-                            all_candidates.append({**c, "_is_new": False})
-                    for u in updated:
-                        if u.get("pipedrive_person_id") and u.get("role_category_id"):
-                            all_candidates.append({**u, "_is_new": False})
-                    for n in new:
-                        if n.get("role_category_id"):
-                            all_candidates.append({**n, "_is_new": True})
-
-                    for missing_pid, affected_deals in deals_by_missing_pid.items():
-                        old_contact = missing_by_pid[missing_pid]
-                        old_name = old_contact.get("name") or "Unknown"
-
-                        old_role_id: int | None = None
-                        for ec in existing_contacts:
-                            if ec.get("person_id") == missing_pid:
-                                old_role_id = ec.get("role_category_id")
-                                break
-
-                        if not all_candidates:
-                            continue
-
-                        best = min(
-                            all_candidates,
-                            key=lambda c: _candidate_sort_key(c, old_role_id),
-                        )
-                        best_role_label = (
-                            ROLE_CATEGORY_OPTIONS.get(best.get("role_category_id", 0))
-                            or best.get("role_category_label")
-                            or best.get("job_title")
-                            or "N/A"
-                        )
-
-                        old_role_label = (
-                            ROLE_CATEGORY_OPTIONS.get(old_role_id) or "Unknown"
-                        )
-
-                        if best.get("_is_new"):
-                            new_switch_map[best.get("name", "")] = {
-                                "old_name": old_name,
-                                "old_role_label": old_role_label,
-                                "new_role_label": best_role_label,
-                                "deals": affected_deals,
-                                "org_name": org_name,
-                                "date_str": date_str,
-                            }
-                            print(
-                                f"[pipeline] Switch recommendation (new contact): "
-                                f"{best.get('name')} for {old_name} on "
-                                f"{len(affected_deals)} deal(s)"
-                            )
-                        else:
-                            existing_switch_queue.append({
-                                "old_name": old_name,
-                                "old_role_label": old_role_label,
-                                "new_name": best.get("name") or "Unknown",
-                                "new_role_label": best_role_label,
-                                "deals": affected_deals,
-                                "new_person_id": best["pipedrive_person_id"],
-                            })
-                            print(
-                                f"[pipeline] Switch recommendation (existing contact): "
-                                f"{best.get('name')} for {old_name} on "
-                                f"{len(affected_deals)} deal(s)"
-                            )
-            except Exception as e:
-                print(f"[pipeline] Deal switch pre-computation failed (non-fatal): {e}")
-
         # Parent message
         parent_text = slack.format_parent_message(
             district_name=result.get("district_name", org_name),
@@ -281,10 +172,9 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
             await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
-        # Post new contacts (with inline switch info if they replace a missing contact)
+        # Post new contacts
         for contact in new:
-            switch_info = new_switch_map.get(contact.get("name", ""))
-            msg = slack.format_new_contact(contact, org_id, date_str, switch_info=switch_info)
+            msg = slack.format_new_contact(contact, org_id, date_str)
             await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
@@ -294,22 +184,26 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
             await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
-        # ── Deal switch messages for existing contacts ─────────
-        # New contact switches are already embedded in the CREATE messages above.
-        # This loop handles cases where the best replacement is already in Pipedrive.
-        for switch in existing_switch_queue:
-            msg = slack.format_switch_contact(
-                old_name=switch["old_name"],
-                old_role_label=switch["old_role_label"],
-                new_name=switch["new_name"],
-                new_role_label=switch["new_role_label"],
-                deals=switch["deals"],
-                new_person_id=switch["new_person_id"],
-                org_name=org_name,
-                date_str=date_str,
-            )
-            await slack.post_thread(thread_ts, msg)
-            await asyncio.sleep(delay)
+        # Post deal alerts for missing contacts who are still the main contact on open deals
+        if missing:
+            try:
+                org_deals = await pipedrive.get_org_deals(org_id, status="open")
+                missing_pids = {m.get("pipedrive_person_id") for m in missing if m.get("pipedrive_person_id")}
+                deals_by_pid: dict[int, list[dict]] = {}
+                for deal in org_deals:
+                    dpid = deal.get("person_id")
+                    if dpid and dpid in missing_pids:
+                        deals_by_pid.setdefault(dpid, []).append(deal)
+
+                for contact in missing:
+                    pid = contact.get("pipedrive_person_id")
+                    affected = deals_by_pid.get(pid)
+                    if affected:
+                        msg = slack.format_former_on_deals(contact, affected, settings.pipedrive_domain)
+                        await slack.post_thread(thread_ts, msg)
+                        await asyncio.sleep(delay)
+            except Exception as e:
+                print(f"[pipeline] Deal check for missing contacts failed (non-fatal): {e}")
 
         # Post research notes if present
         notes = result.get("research_notes")

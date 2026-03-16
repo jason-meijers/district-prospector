@@ -115,7 +115,7 @@ class SlackClient:
             f"• Total: {total:,}"
         )
 
-    def format_new_contact(self, contact: dict, org_id: int, date_str: str, switch_info: dict | None = None) -> str:
+    def format_new_contact(self, contact: dict, org_id: int, date_str: str) -> str:
         role_field_key = PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY
         email_display = f"{contact['email']} _({contact['email_confidence']} confidence)_" if contact.get("email") else "Not found"
         phone_display = contact.get("phone") or "Not found"
@@ -164,10 +164,8 @@ class SlackClient:
         person_body_json = json.dumps(body, indent=2)
         role_label = contact.get("role_category_label") or contact.get("role_category") or "N/A"
 
-        header = f"🆕🔄 *CREATE & SWITCH: {contact['name']}*" if switch_info else f"🆕 *CREATE: {contact['name']}*"
-
-        msg = (
-            f"{header}\n"
+        return (
+            f"🆕 *CREATE: {contact['name']}*\n"
             f"📋 Title: {contact['job_title']}\n"
             f"🏷️ Role Category: {role_label}\n"
             f"📧 Email: {email_display}\n"
@@ -183,28 +181,6 @@ class SlackClient:
             f"```\n{note_content}\n```\n"
             f"--Note End--"
         )
-
-        if switch_info:
-            deal_ids = ", ".join(str(d["deal_id"]) for d in switch_info["deals"])
-            deal_names = ", ".join(d["title"] or f"Deal #{d['deal_id']}" for d in switch_info["deals"])
-            old_role_label = switch_info.get("old_role_label") or "Unknown"
-            new_role_label = switch_info.get("new_role_label") or role_label
-            switch_note = (
-                f"Prospecting Bot: {switch_info['old_name']} no longer appears to be at the district. "
-                f"Replacing {switch_info['old_name']} ({old_role_label}) with {contact['name']} ({new_role_label}). "
-                f"Deal point of contact updated on {switch_info['date_str']}."
-            )
-            msg += (
-                f"\n\n*Action: Switch Point of Contact*\n"
-                f"Replaces: {switch_info['old_name']} ({old_role_label}) → {contact['name']} ({new_role_label})\n"
-                f"📁 Deals: {deal_names}\n"
-                f"Deal ID(s): {deal_ids}\n"
-                f"--Switch Note Start--\n"
-                f"```\n{switch_note}\n```\n"
-                f"--Switch Note End--"
-            )
-
-        return msg
 
     def format_updated_contact(self, contact: dict, date_str: str) -> str:
         changes_display = "\n".join(
@@ -282,42 +258,18 @@ class SlackClient:
             f"_No action needed — contact verified on current site._"
         )
 
-    def format_switch_contact(
-        self,
-        old_name: str,
-        old_role_label: str,
-        new_name: str,
-        new_role_label: str,
-        deals: list[dict],
-        new_person_id: int,
-        org_name: str,
-        date_str: str,
-    ) -> str:
-        deal_names = ", ".join(d["title"] or f"Deal #{d['deal_id']}" for d in deals)
-        deal_ids = ", ".join(str(d["deal_id"]) for d in deals)
-
-        body = {"person_id": new_person_id}
-        body_json = json.dumps(body, indent=2)
-
-        note_content = (
-            f"Prospecting Bot: {old_name} no longer appears to be at the district. "
-            f"Replacing {old_name} ({old_role_label}) with {new_name} ({new_role_label}). "
-            f"Deal point of contact updated on {date_str}."
+    def format_former_on_deals(self, contact: dict, deals: list[dict], pipedrive_domain: str) -> str:
+        name = contact.get("name") or "Unknown"
+        deal_lines = "\n".join(
+            f"• <https://{pipedrive_domain}/deal/{d['deal_id']}|{d['title'] or f'Deal #{d[\"deal_id\"]}'}>"
+            for d in deals
         )
-
+        count = len(deals)
         return (
-            f"🔄 *SWITCH: {new_name} ({new_role_label}) for {old_name} ({old_role_label})*\n"
-            f"📁 Deals: {deal_names}\n\n"
-            f"*Action: Switch Point of Contact*\n"
-            f"Deal ID(s): {deal_ids}\n"
-            f"--Payload Start--\n"
-            f"```\n{body_json}\n```\n"
-            f"--Payload End--\n\n"
-            f"*Action: Add Note*\n"
-            f"Deal ID(s): {deal_ids}\n"
-            f"--Note Start--\n"
-            f"```\n{note_content}\n```\n"
-            f"--Note End--"
+            f"📋 *{name}* is marked Former but is still the main contact on "
+            f"{count} open deal{'s' if count != 1 else ''}:\n"
+            f"{deal_lines}\n\n"
+            f"_Recommend reassigning these deals to an active contact._"
         )
 
     def format_missing_contact(self, contact: dict, website_url: str, date_str: str) -> str:
