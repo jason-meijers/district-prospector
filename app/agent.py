@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import re
+import time
 import anthropic
 from app.config import get_settings, ROLE_CATEGORY_OPTIONS, ROLE_CATEGORY_BY_LABEL
 from app.scraper import fetch_page, clean_html, get_candidate_urls, looks_like_staff_directory, get_pagination_links, fetch_schoolinsites_directory
@@ -206,60 +207,93 @@ class ExtractionAgent:
         self.client = anthropic.Anthropic(api_key=self.settings.anthropic_api_key)
 
     def _call_claude(self, system: str, user_message: str, max_tokens: int = 4096) -> tuple[str | None, dict]:
-        """Call Claude and return (text_response_or_none, usage_dict)."""
-        try:
-            response = self.client.messages.create(
-                model=self.settings.claude_model,
-                max_tokens=max_tokens,
-                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content": user_message}],
-            )
-            usage = {}
-            if getattr(response, "usage", None):
-                u = response.usage
-                usage["input_tokens"] = getattr(u, "input_tokens", 0) or 0
-                usage["output_tokens"] = getattr(u, "output_tokens", 0) or 0
-                usage["cache_creation_input_tokens"] = getattr(u, "cache_creation_input_tokens", 0) or 0
-                usage["cache_read_input_tokens"] = getattr(u, "cache_read_input_tokens", 0) or 0
+        """Call Claude and return (text_response_or_none, usage_dict).
 
-            content = getattr(response, "content", None)
-            if content is None:
-                return None, usage
-            text_parts = []
-            for block in content if isinstance(content, list) else []:
-                if block is None:
-                    continue
-                if isinstance(block, dict):
-                    if block.get("type") == "text" and block.get("text"):
-                        text_parts.append(block.get("text") or "")
+        Automatically retries on rate-limit errors (HTTP 429) with
+        exponential backoff: 60 s → 120 s → 240 s (3 attempts total).
+        """
+        max_retries = 3
+        retry_delay = 60  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                response = self.client.messages.create(
+                    model=self.settings.claude_model,
+                    max_tokens=max_tokens,
+                    system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                    messages=[{"role": "user", "content": user_message}],
+                )
+                usage = {}
+                if getattr(response, "usage", None):
+                    u = response.usage
+                    usage["input_tokens"] = getattr(u, "input_tokens", 0) or 0
+                    usage["output_tokens"] = getattr(u, "output_tokens", 0) or 0
+                    usage["cache_creation_input_tokens"] = getattr(u, "cache_creation_input_tokens", 0) or 0
+                    usage["cache_read_input_tokens"] = getattr(u, "cache_read_input_tokens", 0) or 0
+
+                content = getattr(response, "content", None)
+                if content is None:
+                    return None, usage
+                text_parts = []
+                for block in content if isinstance(content, list) else []:
+                    if block is None:
+                        continue
+                    if isinstance(block, dict):
+                        if block.get("type") == "text" and block.get("text"):
+                            text_parts.append(block.get("text") or "")
+                    else:
+                        if getattr(block, "type", None) == "text":
+                            text_parts.append(getattr(block, "text", None) or "")
+                text = " ".join(text_parts).strip() or None
+                return text, usage
+
+            except anthropic.RateLimitError as e:
+                if attempt < max_retries - 1:
+                    wait = retry_delay * (2 ** attempt)
+                    print(f"[agent] Rate limit hit — waiting {wait}s before retry {attempt + 2}/{max_retries}... ({e})")
+                    time.sleep(wait)
                 else:
-                    if getattr(block, "type", None) == "text":
-                        text_parts.append(getattr(block, "text", None) or "")
-            text = " ".join(text_parts).strip() or None
-            return text, usage
-        except AttributeError as e:
-            if "NoneType" in str(e) or "get" in str(e).lower():
-                print(f"[agent] Claude API response issue (None/get): {e}")
-                return None, {}
-            raise
-        except Exception as e:
-            if "'NoneType' object has no attribute 'get'" in str(e):
-                print(f"[agent] Claude API response issue: {e}")
-                return None, {}
-            raise
+                    print(f"[agent] Rate limit hit — all {max_retries} attempts exhausted.")
+                    raise
+            except AttributeError as e:
+                if "NoneType" in str(e) or "get" in str(e).lower():
+                    print(f"[agent] Claude API response issue (None/get): {e}")
+                    return None, {}
+                raise
+            except Exception as e:
+                if "'NoneType' object has no attribute 'get'" in str(e):
+                    print(f"[agent] Claude API response issue: {e}")
+                    return None, {}
+                raise
+
+        return None, {}  # unreachable, but satisfies the type checker
 
     def _call_claude_with_search(self, system: str, user_message: str, max_tokens: int = 1024) -> str:
         """Call Claude with web search enabled for website discovery."""
-        response = self.client.messages.create(
-            model=self.settings.claude_model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user_message}],
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        )
-        # Extract the final text from the response (may include tool use blocks)
-        text_parts = [block.text for block in response.content if block.type == "text"]
-        return " ".join(text_parts).strip()
+        max_retries = 3
+        retry_delay = 60
+
+        for attempt in range(max_retries):
+            try:
+                response = self.client.messages.create(
+                    model=self.settings.claude_model,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=[{"role": "user", "content": user_message}],
+                    tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                )
+                text_parts = [block.text for block in response.content if block.type == "text"]
+                return " ".join(text_parts).strip()
+            except anthropic.RateLimitError as e:
+                if attempt < max_retries - 1:
+                    wait = retry_delay * (2 ** attempt)
+                    print(f"[agent] Rate limit hit (search) — waiting {wait}s before retry {attempt + 2}/{max_retries}... ({e})")
+                    time.sleep(wait)
+                else:
+                    print(f"[agent] Rate limit hit (search) — all {max_retries} attempts exhausted.")
+                    raise
+
+        return ""  # unreachable
 
     async def discover_website(self, org_name: str) -> str | None:
         """

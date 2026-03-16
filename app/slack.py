@@ -274,25 +274,14 @@ class SlackClient:
 
     def format_missing_contact(self, contact: dict, website_url: str, date_str: str) -> str:
         previous_title = (contact.get("previous_title") or "Unknown").strip()
-        if previous_title == "N/A":
-            new_title = "Unknown (Former)"
-        elif previous_title.rstrip().endswith("(Former)"):
-            new_title = previous_title
-        else:
-            # "Former Superintendent" -> "Superintendent"; then append " (Former)"
-            base = previous_title
-            if base.startswith("Former "):
-                base = base[7:].strip()
-            new_title = f"{base} (Former)" if base else "(Former)"
 
         note_content = (
             f"Prospecting Bot: {contact['name']} was not found on the district "
             f"website ({website_url}). It is likely they are no longer at the district. "
             f"Manual verification recommended."
         )
-        # Pipedrive v2 PATCH body: job_title + custom_fields (Former)
+        # Pipedrive v2 PATCH body: only custom_fields (Role Category → Former); job_title unchanged
         person_body = {
-            "job_title": new_title,
             "custom_fields": {
                 PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY: 475,
             },
@@ -302,8 +291,7 @@ class SlackClient:
         return (
             f"⚠️ *NOT FOUND: {contact['name']}* (ID: {person_id})\n"
             f"📋 Last known title: {previous_title}\n"
-            f"📝 Not found on current district website. Recommend updating to \"(Former)\" and "
-            f"Role Category → Former (see payload below).\n\n"
+            f"📝 Not found on current district website. Recommend updating Role Category → Former (see payload below).\n\n"
             f"*Action: Update Person*\n"
             f"Person ID: {person_id}\n"
             f"--Payload Start--\n"
