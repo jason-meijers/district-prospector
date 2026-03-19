@@ -86,9 +86,36 @@ async def fetch_page(url: str, timeout: int = 15) -> str | None:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
                 resp = await client.get(target_url, headers={"User-Agent": ua})
                 resp.raise_for_status()
-                return resp.text
+                text = resp.text or ""
+                print(
+                    f"[scraper] Fetched {target_url} "
+                    f"(final={resp.url}, status={resp.status_code}, bytes={len(text)})"
+                )
+                return text
+        except httpx.TimeoutException as e:
+            print(
+                f"[scraper] Timeout fetching {target_url} "
+                f"(ua={ua[:32]}..., timeout={timeout}s): {type(e).__name__}: {e}"
+            )
+            return None
+        except httpx.HTTPStatusError as e:
+            resp = e.response
+            print(
+                f"[scraper] HTTP error fetching {target_url} "
+                f"(final={resp.url}, status={resp.status_code}, ua={ua[:32]}...): {e}"
+            )
+            return None
+        except httpx.RequestError as e:
+            print(
+                f"[scraper] Request error fetching {target_url} "
+                f"(ua={ua[:32]}...): {type(e).__name__}: {e}"
+            )
+            return None
         except Exception as e:
-            print(f"[scraper] Failed to fetch {target_url}: {e}")
+            print(
+                f"[scraper] Unexpected error fetching {target_url}: "
+                f"{type(e).__name__}: {e}"
+            )
             return None
 
     html = await _get(url, _BROWSER_UA)

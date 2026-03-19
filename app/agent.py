@@ -549,6 +549,7 @@ class ExtractionAgent:
         # Step 3a: Fetch homepage
         homepage_html = await fetch_page(website_url)
         if not homepage_html:
+            print(f"[agent] Homepage fetch failed for {website_url} (empty/None response)")
             return {"error": f"Could not reach {website_url}"}
 
         # Step 3b: Identify best subpages

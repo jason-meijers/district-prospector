@@ -321,12 +321,17 @@ async def pipedrive_webhook(request: Request, background_tasks: BackgroundTasks)
     # and the v2 shape {data, previous, meta.entity, data.custom_fields}.
     meta = body.get("meta", {}) or {}
 
+    trigger_field_present_in_current = False
+    trigger_field_present_in_previous = False
+
     if "data" in body:
         # v2 style payload (what we're currently seeing in logs)
         data = body.get("data") or {}
         previous = body.get("previous") or {}
         data_custom = data.get("custom_fields") or {}
         prev_custom = previous.get("custom_fields") or {}
+        trigger_field_present_in_current = PIPEDRIVE_TRIGGER_FIELD_KEY in data_custom
+        trigger_field_present_in_previous = PIPEDRIVE_TRIGGER_FIELD_KEY in prev_custom
         current_value_raw = data_custom.get(PIPEDRIVE_TRIGGER_FIELD_KEY)
         previous_value_raw = prev_custom.get(PIPEDRIVE_TRIGGER_FIELD_KEY)
         org_id = data.get("id")
@@ -335,6 +340,8 @@ async def pipedrive_webhook(request: Request, background_tasks: BackgroundTasks)
         # legacy style payload
         current = body.get("current", {}) or {}
         previous = body.get("previous", {}) or {}
+        trigger_field_present_in_current = PIPEDRIVE_TRIGGER_FIELD_KEY in current
+        trigger_field_present_in_previous = PIPEDRIVE_TRIGGER_FIELD_KEY in previous
         current_value_raw = current.get(PIPEDRIVE_TRIGGER_FIELD_KEY)
         previous_value_raw = previous.get(PIPEDRIVE_TRIGGER_FIELD_KEY)
         org_id = current.get("id")
@@ -350,6 +357,18 @@ async def pipedrive_webhook(request: Request, background_tasks: BackgroundTasks)
         if isinstance(value, dict) and "id" in value:
             return value.get("id")
         return value
+
+    # Only run when we can confirm the trigger FIELD itself changed.
+    # Some Pipedrive update payloads can omit previous custom fields for
+    # unrelated changes, which otherwise causes false positives if current
+    # still equals the trigger option.
+    if not trigger_field_present_in_current or not trigger_field_present_in_previous:
+        print(
+            "[webhook] ignored: trigger field not explicitly present in both current and previous payloads",
+            "present_current:", trigger_field_present_in_current,
+            "present_previous:", trigger_field_present_in_previous,
+        )
+        return {"status": "ignored", "reason": "trigger field not explicitly changed"}
 
     # Check if the trigger field changed to the "Trigger" option (ID 632)
     current_value = _extract_option_id(current_value_raw)
