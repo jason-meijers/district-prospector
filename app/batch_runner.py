@@ -243,8 +243,9 @@ async def _post_batch_result_to_slack(result: dict) -> None:
 
 async def run_batch(limit: int = 50, run_dedup: bool = True) -> dict:
     """
-    Main batch runner. Claims up to `limit` pending districts from Supabase
-    and processes them with concurrency controlled by batch_concurrency setting.
+    Main batch runner. Claims up to `limit` districts from Supabase
+    (`manual` first, then `pending`) and processes them with concurrency
+    controlled by batch_concurrency setting.
 
     Args:
         limit: max number of districts to process in this run
@@ -266,7 +267,7 @@ async def run_batch(limit: int = 50, run_dedup: bool = True) -> dict:
             break
         districts.append(claimed)
     if not districts:
-        print("[batch] No pending districts in queue")
+        print("[batch] No manual or pending districts in queue")
         return {"processed": 0, "done": 0, "errors": 0, "total_contacts": 0}
 
     print(f"[batch] Starting batch run: {len(districts)} districts (concurrency={settings.batch_concurrency})")

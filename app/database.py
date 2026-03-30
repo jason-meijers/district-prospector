@@ -38,11 +38,11 @@ def _get_client() -> Client:
 
 def claim_next_district() -> dict | None:
     """
-    Atomically claim the next pending district for processing.
+    Atomically claim the next district for processing.
 
-    Uses a raw SQL query with FOR UPDATE SKIP LOCKED so multiple workers
-    can run in parallel without processing the same district twice.
-    Returns the district row dict, or None if the queue is empty.
+    Prefers status='manual' (most recently updated first), then 'pending'
+    (oldest created_at first). Uses FOR UPDATE SKIP LOCKED so parallel
+    workers never claim the same row. Returns None if the queue is empty.
     """
     client = _get_client()
     result = client.rpc("claim_next_district").execute()
@@ -388,7 +388,7 @@ def get_district_counts() -> dict[str, int]:
         return {r["status"]: r["count"] for r in result.data}
     # Fallback: query each status individually
     counts = {}
-    for status in ("pending", "processing", "done", "error"):
+    for status in ("manual", "pending", "processing", "done", "error"):
         r = (
             client.table("districts")
             .select("id", count="exact")

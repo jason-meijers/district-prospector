@@ -479,7 +479,8 @@ async def _sync_districts_background(skip_existing: bool) -> None:
 @app.post("/batch/run")
 async def start_batch_run(payload: BatchRunRequest, background_tasks: BackgroundTasks):
     """
-    Start a batch run. Claims up to `limit` pending districts from Supabase
+    Start a batch run. Claims up to `limit` districts from Supabase
+    (status `manual` first — most recently updated; then `pending` FIFO)
     and processes them asynchronously. Returns immediately.
     """
     settings = get_settings()
