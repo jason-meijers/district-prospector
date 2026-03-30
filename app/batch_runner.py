@@ -16,6 +16,17 @@ from app.database import (
 from app.slack import SlackClient
 
 
+def _slack_district_org_link(
+    district_name: str, pipedrive_org_id: int | None, pipedrive_domain: str
+) -> str:
+    """Slack mrkdwn: link org name to Pipedrive organization when we have an ID."""
+    label = district_name.replace("|", "·")
+    if pipedrive_org_id:
+        url = f"https://{pipedrive_domain}/organization/{pipedrive_org_id}"
+        return f"<{url}|{label}>"
+    return label
+
+
 async def _process_one_district(
     district: dict,
     agent: BatchExtractionAgent,
@@ -34,6 +45,8 @@ async def _process_one_district(
     org_name = district["name"]
     website_url = district.get("website_url") or ""
     pipedrive_org_id = district.get("pipedrive_org_id")
+
+    settings = get_settings()
 
     async with semaphore:
         print(f"[batch] Starting: {org_name} ({website_url})")
@@ -67,7 +80,13 @@ async def _process_one_district(
                     msg = "No website found via Firecrawl search"
                     print(f"[batch] Skipping {org_name}: {msg}")
                     mark_district_error(district_id, msg)
-                    return {"district": org_name, "status": "error", "reason": msg, "contacts": 0}
+                    return {
+                        "district": org_name,
+                        "status": "error",
+                        "reason": msg,
+                        "contacts": 0,
+                        "pipedrive_org_id": pipedrive_org_id,
+                    }
 
             # Step 1b: Scrape via Firecrawl
             pages = await scrape_district(website_url)
@@ -85,7 +104,13 @@ async def _process_one_district(
                     msg = f"No content retrieved from {website_url}"
                     print(f"[batch] {org_name}: {msg}")
                     mark_district_error(district_id, msg)
-                    return {"district": org_name, "status": "error", "reason": msg, "contacts": 0}
+                    return {
+                        "district": org_name,
+                        "status": "error",
+                        "reason": msg,
+                        "contacts": 0,
+                        "pipedrive_org_id": pipedrive_org_id,
+                    }
 
             used_urls = [p.get("url") for p in pages if p.get("url")]
 
@@ -112,6 +137,7 @@ async def _process_one_district(
                 "website_url": website_url,
                 "used_urls": used_urls,
                 "contacts_detail": contacts,
+                "pipedrive_org_id": pipedrive_org_id,
             }
 
         except Exception as e:
@@ -127,6 +153,7 @@ async def _process_one_district(
                 "website_url": website_url,
                 "used_urls": [],
                 "contacts_detail": [],
+                "pipedrive_org_id": pipedrive_org_id,
             }
 
 
@@ -136,13 +163,25 @@ def _format_batch_contact_line(contact: dict) -> str:
     role_category = contact.get("role_category") or contact.get("role_category_id") or "Unknown"
     email = contact.get("email") or "N/A"
     phone = contact.get("phone") or "N/A"
-    return f"• {name} | {email} | {phone} | {role_category} | {role}"
+    source_url = (contact.get("source_url") or "").strip() or "N/A"
+    return f"• {name} | {email} | {phone} | {role_category} | {role}\n  source: {source_url}"
 
 
 async def _post_batch_result_to_slack(result: dict) -> None:
     try:
         slack = SlackClient()
-        district = result.get("district", "Unknown district")
+        settings = get_settings()
+        district_name = result.get("district", "Unknown district")
+        pd_org_id_raw = result.get("pipedrive_org_id")
+        if isinstance(pd_org_id_raw, str) and pd_org_id_raw.isdigit():
+            pd_org_id: int | None = int(pd_org_id_raw)
+        elif isinstance(pd_org_id_raw, int):
+            pd_org_id = pd_org_id_raw
+        else:
+            pd_org_id = None
+        district_display = _slack_district_org_link(
+            district_name, pd_org_id, settings.pipedrive_domain
+        )
         status = result.get("status")
         website = result.get("website_url") or "N/A"
         used_urls = result.get("used_urls") or []
@@ -152,18 +191,28 @@ async def _post_batch_result_to_slack(result: dict) -> None:
             reason = result.get("reason") or "Unknown error"
             text = (
                 f"❌ *Batch district failed*\n"
-                f"District: {district}\n"
+                f"District: {district_display}\n"
                 f"Website attempted: {website}\n"
                 f"Reason: {reason}"
             )
             await slack.post_message(text)
             return
 
+        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        in_tok = int(usage.get("input_tokens") or 0)
+        out_tok = int(usage.get("output_tokens") or 0)
+        cache_create = int(usage.get("cache_creation_input_tokens") or 0)
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        tok_line = f"Claude tokens: {in_tok:,} in / {out_tok:,} out"
+        if cache_create or cache_read:
+            tok_line += f" (cache create {cache_create:,} / read {cache_read:,})"
+
         parent = (
             f"✅ *Batch district complete*\n"
-            f"District: {district}\n"
+            f"District: {district_display}\n"
             f"Website used: {website}\n"
-            f"Contacts found: {len(contacts)}"
+            f"Contacts found: {len(contacts)}\n"
+            f"{tok_line}"
         )
         thread_ts = await slack.post_message(parent)
         if not thread_ts:
@@ -184,7 +233,7 @@ async def _post_batch_result_to_slack(result: dict) -> None:
                 body += f"\n• ... and {more_contacts} more contact(s)"
             await slack.post_thread(
                 thread_ts,
-                "👥 *Contacts found* (`name | email | phone | role category | role`)\n" + body,
+                "👥 *Contacts found* (each line ends with `source:` page URL)\n" + body,
             )
         else:
             await slack.post_thread(thread_ts, "👥 *Contacts found*\nNone")
