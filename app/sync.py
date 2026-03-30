@@ -29,64 +29,70 @@ async def sync_pipedrive_contacts() -> dict:
     token = settings.pipedrive_api_token
 
     print("[sync] Starting Pipedrive contacts sync...")
-    persons = await _fetch_all_persons(base_url, token)
-    print(f"[sync] Fetched {len(persons)} total persons from Pipedrive")
-
-    # Keep all active, non-deleted contacts so dedup checks are as safe
-    # as possible even when role_category is missing or inconsistent.
-    snapshot_persons = []
-    for p in persons:
-        if not p.get("active_flag", True):
-            continue
-        if p.get("deleted") or p.get("archived") or p.get("merge_into_id"):
-            continue
-
-        snapshot_persons.append(p)
-
-    print(f"[sync] {len(snapshot_persons)} active persons eligible for snapshot")
 
     # Clear old snapshot and rebuild
     db.table("pipedrive_contacts_snapshot").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+    total_fetched = 0
+    synced = 0
+    start = 0
+    page_size = 500
+    upsert_chunk_size = 200
 
-    if not snapshot_persons:
-        return {"total_fetched": len(persons), "synced": 0}
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            resp = await client.get(
+                f"{base_url}/persons",
+                params={"api_token": token, "start": start, "limit": page_size},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            items = body.get("data") or []
+            total_fetched += len(items)
 
-    records = []
-    for p in snapshot_persons:
-        org = p.get("org_id")
-        org_id = org.get("value") if isinstance(org, dict) else org
+            records = []
+            for p in items:
+                if not p.get("active_flag", True):
+                    continue
+                if p.get("deleted") or p.get("archived") or p.get("merge_into_id"):
+                    continue
 
-        email = None
-        for e in (p.get("email") or []):
-            if e.get("primary") or not email:
-                email = e.get("value") or None
+                org = p.get("org_id")
+                org_id = org.get("value") if isinstance(org, dict) else org
 
-        name = (p.get("name") or "").strip()
+                email = None
+                for e in (p.get("email") or []):
+                    if e.get("primary") or not email:
+                        email = e.get("value") or None
 
-        records.append({
-            "pipedrive_person_id": p["id"],
-            "pipedrive_org_id": org_id,
-            "name": name,
-            "name_normalized": _normalize_name(name),
-            "email": email,
-            "job_title": p.get("job_title") or None,
-            "role_category_id": _extract_role_id(p),
-        })
+                name = (p.get("name") or "").strip()
+                records.append({
+                    "pipedrive_person_id": p["id"],
+                    "pipedrive_org_id": org_id,
+                    "name": name,
+                    "name_normalized": _normalize_name(name),
+                    "email": email,
+                    "job_title": p.get("job_title") or None,
+                    "role_category_id": _extract_role_id(p),
+                })
 
-    # Upsert in batches of 500
-    batch_size = 500
-    inserted = 0
-    for i in range(0, len(records), batch_size):
-        batch = records[i: i + batch_size]
-        db.table("pipedrive_contacts_snapshot").upsert(
-            batch,
-            on_conflict="pipedrive_person_id",
-        ).execute()
-        inserted += len(batch)
-        print(f"[sync] Upserted {inserted}/{len(records)} records...")
+            for i in range(0, len(records), upsert_chunk_size):
+                batch = records[i: i + upsert_chunk_size]
+                db.table("pipedrive_contacts_snapshot").upsert(
+                    batch,
+                    on_conflict="pipedrive_person_id",
+                ).execute()
+                synced += len(batch)
 
-    print(f"[sync] Sync complete — {inserted} records in snapshot")
-    return {"total_fetched": len(persons), "synced": inserted}
+            print(f"[sync] Processed page start={start}: fetched={total_fetched}, synced={synced}")
+
+            pagination = body.get("additional_data", {}).get("pagination", {})
+            if pagination.get("more_items_in_collection"):
+                start = pagination.get("next_start", start + page_size)
+            else:
+                break
+
+    print(f"[sync] Sync complete — fetched={total_fetched}, synced={synced}")
+    return {"total_fetched": total_fetched, "synced": synced}
 
 
 async def _fetch_all_persons(base_url: str, token: str) -> list[dict]:
