@@ -428,6 +428,27 @@ async def scrape_district(base_url: str) -> list[dict]:
     pages = await scrape_pages(all_urls)
     print(f"[firecrawl] Scraped {len(pages)} pages for {base_url}")
 
+    # Fallback: if Firecrawl produced nothing, fetch homepage directly.
+    # This keeps the pipeline moving on sites where map/scrape APIs return
+    # empty payloads despite the site being reachable.
+    if not pages:
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                resp = await client.get(base_url, headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    )
+                })
+                resp.raise_for_status()
+                html = resp.text or ""
+                if len(html) > 100:
+                    pages.append({"url": f"{base_url} [direct_html_fallback]", "content": html})
+                    print(f"[firecrawl] Added direct HTML fallback content for {base_url} ({len(html)} chars)")
+        except Exception as e:
+            print(f"[firecrawl] Direct HTML fallback failed for {base_url}: {type(e).__name__}: {e}")
+
     # Step 3: SchoolInsites supplement (check homepage)
     si_text = await _fetch_schoolinsites_directory(base_url)
     if si_text:
