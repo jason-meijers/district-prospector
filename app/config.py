@@ -21,6 +21,10 @@ PIPEDRIVE_LAST_RESEARCHED_FIELD_KEY = "07c187825ba2796affd2bbdaf34e34db5c616b35"
 # Organization: Website URL field
 PIPEDRIVE_WEBSITE_FIELD_KEY = "4a4f94dd89f0afbdf947300ce0972423b04afd74"
 
+# Organization: District name field — used to identify school district orgs.
+# Only orgs where this field is non-empty are synced into the batch pipeline.
+PIPEDRIVE_DISTRICT_NAME_FIELD_KEY = "032ab30b355f790ba1fe3e8deb5413b73530b47b"
+
 # Person: "Role Category" dropdown
 PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY = "7f22b8624616bef2d0adce26b28f8b3055dcbaae"
 
@@ -97,13 +101,28 @@ class Settings(BaseSettings):
     slack_bot_token: str
     slack_channel_id: str
 
-    # Agent
+    # Agent (existing webhook flow)
     max_subpages: int = 7
     max_directory_pages: int = 2  # extra pagination pages to fetch per staff-directory-like URL
     claude_model: str = "claude-sonnet-4-20250514"
 
     # Optional: require this secret on /webhook/pipedrive (header X-Webhook-Secret or query ?secret=)
     webhook_secret: str | None = None
+
+    # Batch pipeline (all optional so existing webhook flow works without them)
+    supabase_url: str | None = None
+    supabase_service_key: str | None = None
+    firecrawl_api_key: str | None = None
+
+    # How many districts to process in parallel per batch run
+    batch_concurrency: int = 10
+    # Max distinct target URLs to scrape per district (not counting pagination within a directory)
+    batch_max_target_pages: int = 5
+    # Max characters to pass to Claude per page (controls token cost)
+    batch_chars_per_page: int = 4000
+
+    # Google Sheets ID for EOD review export (optional)
+    google_sheet_id: str | None = None
 
     class Config:
         env_file = ".env"

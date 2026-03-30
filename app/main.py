@@ -3,8 +3,9 @@ import asyncio
 import traceback
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -413,3 +414,169 @@ async def manual_trigger(payload: ManualTrigger, background_tasks: BackgroundTas
         run_research_pipeline, payload.org_id, payload.website_url
     )
     return {"status": "accepted", "org_id": payload.org_id}
+
+
+# ─────────────────────────────────────────────────────────────
+# Batch Pipeline Endpoints
+# ─────────────────────────────────────────────────────────────
+
+class BatchRunRequest(BaseModel):
+    limit: int = 50
+    run_dedup: bool = True
+
+
+class DistrictImportRow(BaseModel):
+    name: str
+    website_url: Optional[str] = None
+    state: Optional[str] = None
+    pipedrive_org_id: Optional[int] = None
+
+
+class DistrictImportRequest(BaseModel):
+    districts: list[DistrictImportRow]
+
+
+class ApproveContactsRequest(BaseModel):
+    new_contact_ids: list[str]
+
+
+async def _run_batch_background(limit: int, run_dedup: bool) -> None:
+    from app.batch_runner import run_batch
+    try:
+        summary = await run_batch(limit=limit, run_dedup=run_dedup)
+        print(f"[batch endpoint] Batch complete: {summary}")
+    except Exception as e:
+        print(f"[batch endpoint] Batch run failed: {e}")
+        traceback.print_exc()
+
+
+async def _sync_pipedrive_background() -> None:
+    from app.sync import sync_pipedrive_contacts
+    try:
+        summary = await sync_pipedrive_contacts()
+        print(f"[sync endpoint] Contacts sync complete: {summary}")
+    except Exception as e:
+        print(f"[sync endpoint] Contacts sync failed: {e}")
+        traceback.print_exc()
+
+
+async def _sync_districts_background(skip_existing: bool) -> None:
+    from app.sync import sync_districts_from_pipedrive
+    try:
+        summary = await sync_districts_from_pipedrive(skip_existing=skip_existing)
+        print(f"[sync endpoint] Districts sync complete: {summary}")
+    except Exception as e:
+        print(f"[sync endpoint] Districts sync failed: {e}")
+        traceback.print_exc()
+
+
+@app.post("/batch/run")
+async def start_batch_run(payload: BatchRunRequest, background_tasks: BackgroundTasks):
+    """
+    Start a batch run. Claims up to `limit` pending districts from Supabase
+    and processes them asynchronously. Returns immediately.
+    """
+    settings = get_settings()
+    if not settings.supabase_url or not settings.firecrawl_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Batch pipeline not configured. Set SUPABASE_URL, SUPABASE_SERVICE_KEY, and FIRECRAWL_API_KEY."
+        )
+    background_tasks.add_task(_run_batch_background, payload.limit, payload.run_dedup)
+    return {"status": "accepted", "limit": payload.limit, "run_dedup": payload.run_dedup}
+
+
+@app.get("/batch/status")
+async def batch_status():
+    """Return district queue counts by status."""
+    try:
+        from app.database import get_district_counts
+        counts = get_district_counts()
+        return {"status": "ok", "districts": counts}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/batch/sync-pipedrive")
+async def sync_pipedrive(background_tasks: BackgroundTasks):
+    """
+    Manually trigger a Pipedrive contacts sync.
+    Fetches all persons from Pipedrive and rebuilds the snapshot table.
+    """
+    settings = get_settings()
+    if not settings.supabase_url:
+        raise HTTPException(status_code=503, detail="SUPABASE_URL not configured")
+    background_tasks.add_task(_sync_pipedrive_background)
+    return {"status": "accepted", "message": "Pipedrive sync started in background"}
+
+
+@app.post("/districts/import")
+async def import_districts(payload: DistrictImportRequest):
+    """
+    Bulk import districts. Each row needs at minimum a name.
+    Optional: website_url, state, pipedrive_org_id.
+    Imported districts start with status='pending' and join the work queue.
+    """
+    try:
+        from app.database import import_districts as db_import
+        rows = [d.model_dump() for d in payload.districts]
+        count = db_import(rows)
+        return {"status": "ok", "imported": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SyncDistrictsRequest(BaseModel):
+    skip_existing: bool = True
+
+
+@app.post("/districts/sync-from-pipedrive")
+async def sync_districts_from_pipedrive(
+    payload: SyncDistrictsRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Pull all Pipedrive organizations into the districts table.
+
+    - skip_existing=true (default): only adds new orgs, leaves existing rows untouched.
+    - skip_existing=false: also updates name and website_url for existing rows.
+
+    This is the easiest way to seed the districts table from your existing
+    Pipedrive data. Run once to populate, then add any non-Pipedrive districts
+    via /districts/import.
+    """
+    settings = get_settings()
+    if not settings.supabase_url:
+        raise HTTPException(status_code=503, detail="SUPABASE_URL not configured")
+    background_tasks.add_task(_sync_districts_background, payload.skip_existing)
+    return {
+        "status": "accepted",
+        "message": "Districts sync from Pipedrive started in background",
+        "skip_existing": payload.skip_existing,
+    }
+
+
+@app.post("/batch/approve")
+async def approve_contacts(payload: ApproveContactsRequest, background_tasks: BackgroundTasks):
+    """
+    Approve a list of new_contact IDs for Pipedrive write.
+    Triggers the Pipedrive person creation for each approved contact.
+    """
+    if not payload.new_contact_ids:
+        return {"status": "ok", "queued": 0}
+    background_tasks.add_task(_write_approved_to_pipedrive, payload.new_contact_ids)
+    return {"status": "accepted", "queued": len(payload.new_contact_ids)}
+
+
+async def _write_approved_to_pipedrive(new_contact_ids: list[str]) -> None:
+    """
+    For each approved new_contact, create the person in Pipedrive and
+    mark the row as approved with the created timestamp.
+    """
+    from app.pipedrive_writer import write_approved_contacts
+    try:
+        results = await write_approved_contacts(new_contact_ids)
+        print(f"[approve] Wrote {results['created']} contacts to Pipedrive, {results['errors']} errors")
+    except Exception as e:
+        print(f"[approve] Pipedrive write failed: {e}")
+        traceback.print_exc()
