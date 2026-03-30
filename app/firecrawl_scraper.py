@@ -17,12 +17,16 @@ _MAP_SEARCH_TERMS = (
 _LOW_VALUE_SEGMENTS = {
     "board", "board_of_education", "board-of-education",
     "policy", "policies", "financial", "finance", "budget",
-    "enrollment", "calendar", "substitute", "employment", "jobs",
+    "enrollment", "enroll", "calendar", "substitute", "employment", "jobs",
     "bids", "rfp", "proposals", "athletics", "sports",
     "parent", "student", "food", "nutrition", "transportation",
     "elementary", "primary", "k-5", "middle-school", "middle_school",
-    "preschool", "pre-k",
+    "preschool", "pre-k", "news", "pub", "sitemap", "gallery", "photos",
+    "new-families", "resources",
 }
+
+# URL path extensions / filenames to exclude entirely
+_EXCLUDED_EXTENSIONS = {".xml", ".pdf", ".doc", ".docx", ".xls", ".xlsx"}
 
 # URL segments that score higher — pages likely to contain leadership or staff.
 _HIGH_VALUE_SEGMENTS = {
@@ -192,14 +196,22 @@ async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]
         scored = [(url, _score_url(url)) for url in urls if isinstance(url, str)]
         scored.sort(key=lambda x: -x[1])
 
-        # Keep only URLs with a non-negative score, then apply path diversity:
-        # limit each second-level path prefix to at most 2 URLs so a single
-        # department branch can't consume all available slots.
+        # Keep only URLs with a non-negative score; exclude known file types.
+        # Within same score tier, prefer shorter (parent) paths over deep sub-pages
+        # so the main department page is always selected before its children.
+        # Then apply path diversity: cap each second-level branch at 2 URLs so a
+        # single department can't consume all available slots.
+        scored_clean = [
+            (url, score) for url, score in scored
+            if score >= 0
+            and not any(url.lower().endswith(ext) for ext in _EXCLUDED_EXTENSIONS)
+        ]
+        # Secondary sort: path length ascending (shorter = parent page first)
+        scored_clean.sort(key=lambda x: (-x[1], len(urlparse(x[0]).path)))
+
         filtered: list[str] = []
         branch_counts: dict[str, int] = {}
-        for url, score in scored:
-            if score < -1:
-                continue
+        for url, _score in scored_clean:
             parts = urlparse(url).path.strip("/").split("/")
             branch = "/".join(parts[:2]) if len(parts) >= 2 else parts[0] if parts else ""
             if branch_counts.get(branch, 0) >= 2:
