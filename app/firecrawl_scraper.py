@@ -185,7 +185,9 @@ async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]
         )
 
         urls = _extract_urls_from_map(result)
-        print(f"[firecrawl] map returned {len(urls)} URLs for {base_url} (type={type(result).__name__}, links_attr={hasattr(result, 'links')})")
+        # Debug: log the raw result so we can understand the response shape
+        raw_repr = repr(result)[:500]
+        print(f"[firecrawl] map returned {len(urls)} URLs for {base_url} (type={type(result).__name__}, links_attr={hasattr(result, 'links')}, raw={raw_repr})")
 
         # Filter and score
         scored = [(url, _score_url(url)) for url in urls if isinstance(url, str)]
@@ -482,26 +484,37 @@ async def scrape_district(base_url: str) -> list[dict]:
     pages = await scrape_pages(all_urls)
     print(f"[firecrawl] Scraped {len(pages)} pages for {base_url}")
 
-    # Step 3: if Firecrawl produced nothing, fall back to direct HTML fetching
-    if not pages:
-        print(f"[firecrawl] Firecrawl returned 0 pages — falling back to direct HTML fetch for {base_url}")
+    # Step 3: if Firecrawl map found no subpages (or total pages still < 2),
+    # use direct HTML to discover subpages and fetch them. This runs even if the
+    # homepage was scraped — we still need subpages to find contacts.
+    if not subpage_urls:
+        print(f"[firecrawl] map found no subpages — using HTML fallback for subpage discovery on {base_url}")
+        # Try to get homepage HTML (reuse Firecrawl markdown if we have it, else fetch directly)
         homepage_html = await _fetch_html(base_url)
 
         if homepage_html and len(homepage_html) > 100:
-            # Discover subpage URLs from homepage links
             discovered = _discover_subpage_urls_from_html(
                 homepage_html, base_url, max_urls=settings.batch_max_target_pages
             )
             print(f"[firecrawl] HTML fallback discovered {len(discovered)} candidate subpage URLs for {base_url}")
 
-            # Fetch subpages directly
             if discovered:
-                subpages = await _fetch_pages_direct(discovered)
-                pages.extend(subpages)
-                print(f"[firecrawl] HTML fallback fetched {len(subpages)} subpages for {base_url}")
+                # First try Firecrawl for these pages (better content quality)
+                fc_subpages = await scrape_pages(discovered)
+                if fc_subpages:
+                    print(f"[firecrawl] Firecrawl scraped {len(fc_subpages)} discovered subpages for {base_url}")
+                    pages.extend(fc_subpages)
+                else:
+                    # Firecrawl still failing — fetch directly
+                    direct_subpages = await _fetch_pages_direct(discovered)
+                    print(f"[firecrawl] direct HTTP fetched {len(direct_subpages)} subpages for {base_url}")
+                    pages.extend(direct_subpages)
 
-            # Also include homepage itself
-            pages.append({"url": f"{base_url} [direct_fallback]", "content": homepage_html})
+        # If we have no pages at all yet, add homepage via direct fetch
+        if not pages:
+            homepage_html = homepage_html or await _fetch_html(base_url)
+            if homepage_html and len(homepage_html) > 100:
+                pages.append({"url": f"{base_url} [direct_fallback]", "content": homepage_html})
 
     # Step 4: SchoolInsites supplement (check homepage)
     si_text = await _fetch_schoolinsites_directory(base_url)
