@@ -118,8 +118,9 @@ class Settings(BaseSettings):
     batch_concurrency: int = 10
     # Max distinct target URLs to scrape per district (not counting pagination within a directory)
     batch_max_target_pages: int = 15
-    # Max characters to pass to Claude per page (controls token cost)
-    batch_chars_per_page: int = 4000
+    # Max characters to pass to Claude per page (controls token cost).
+    # 12k avoids losing staff blocks on sites with heavy repeated nav before main content.
+    batch_chars_per_page: int = 12000
 
     # Google Sheets ID for EOD review export (optional)
     google_sheet_id: str | None = None
