@@ -1,5 +1,4 @@
 from __future__ import annotations
-import asyncio
 import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
@@ -47,49 +46,56 @@ def _score_url(url: str) -> int:
     return score
 
 
-def _get_firecrawl():
-    """Return an initialised Firecrawl client (v4+ Firecrawl class)."""
+def _get_async_firecrawl():
+    """Return an initialised AsyncFirecrawl client (v4+ SDK)."""
     settings = get_settings()
     if not settings.firecrawl_api_key:
         raise RuntimeError("FIRECRAWL_API_KEY is not set in environment")
-    from firecrawl import Firecrawl
-    return Firecrawl(api_key=settings.firecrawl_api_key)
+    from firecrawl import AsyncFirecrawl
+    return AsyncFirecrawl(api_key=settings.firecrawl_api_key)
 
 
 def _extract_urls_from_map(result: object) -> list[str]:
     """
     Extract URL strings from a Firecrawl map() response.
 
-    v4 SDK returns a typed object with a .links attribute (list[str]).
-    Older versions return a dict or plain list.
+    v4 SDK returns a typed object whose .links attribute is a list of
+    objects/dicts with a "url" key (not plain strings).  Older versions
+    may return plain string lists or raw dicts.
     """
-    # v4 typed object
+    def _url_from_item(item: object) -> str | None:
+        if isinstance(item, str):
+            return item
+        # typed SDK object (e.g. MapResponseLinksItem)
+        if hasattr(item, "url") and isinstance(item.url, str):  # type: ignore[union-attr]
+            return item.url  # type: ignore[union-attr]
+        # plain dict
+        if isinstance(item, dict):
+            u = item.get("url") or item.get("link") or item.get("href")
+            if isinstance(u, str):
+                return u
+        return None
+
+    # v4 typed object with .links attribute
     if hasattr(result, "links"):
         links = result.links  # type: ignore[union-attr]
         if isinstance(links, list):
-            return [u for u in links if isinstance(u, str)]
+            return [u for item in links if (u := _url_from_item(item)) is not None]
 
-    # dict shapes
+    # dict shapes (older SDK or raw API response)
     if isinstance(result, dict):
         for key in ("links", "urls", "results"):
             candidates = result.get(key)
-            if candidates:
-                break
-        else:
-            candidates = (result.get("data") or []) if isinstance(result.get("data"), list) else []
-        urls = []
-        for item in (candidates or []):
-            if isinstance(item, str):
-                urls.append(item)
-            elif isinstance(item, dict):
-                u = item.get("url") or item.get("link") or item.get("href")
-                if isinstance(u, str):
-                    urls.append(u)
-        return urls
+            if candidates and isinstance(candidates, list):
+                return [u for item in candidates if (u := _url_from_item(item)) is not None]
+        # nested under "data"
+        data = result.get("data")
+        if isinstance(data, list):
+            return [u for item in data if (u := _url_from_item(item)) is not None]
 
     # plain list
     if isinstance(result, list):
-        return [u for u in result if isinstance(u, str)]
+        return [u for item in result if (u := _url_from_item(item)) is not None]
 
     return []
 
@@ -133,11 +139,9 @@ def _extract_search_urls(result: object) -> list[str]:
     v4 returns dict with result.get("web") as list[dict] each with a "url" key.
     """
     if isinstance(result, dict):
-        # v4 shape
         web = result.get("web") or []
         if web:
             return [item.get("url") for item in web if isinstance(item, dict) and item.get("url")]
-        # fallback keys
         for key in ("data", "results", "links", "urls"):
             candidates = result.get(key)
             if isinstance(candidates, list):
@@ -166,8 +170,7 @@ def _extract_search_urls(result: object) -> list[str]:
 
 async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]:
     """
-    Use Firecrawl's map endpoint with a staff-focused search term to discover
-    the most relevant pages on a district website.
+    Use Firecrawl's map endpoint to discover relevant pages on a district website.
 
     Returns up to max_urls URLs ranked by relevance, filtering out low-value
     pages (board, policies, enrollment, elementary/middle-school, etc.).
@@ -176,20 +179,16 @@ async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]
     limit = max_urls or settings.batch_max_target_pages
     fetch_limit = min(limit * 8, 50)
 
-    app = _get_firecrawl()
+    app = _get_async_firecrawl()
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: app.map(url=base_url, limit=fetch_limit)
-        )
+        result = await app.map(url=base_url, limit=fetch_limit)
 
         urls = _extract_urls_from_map(result)
-        # Debug: log the raw result so we can understand the response shape
-        raw_repr = repr(result)[:500]
-        print(f"[firecrawl] map returned {len(urls)} URLs for {base_url} (type={type(result).__name__}, links_attr={hasattr(result, 'links')}, raw={raw_repr})")
+        raw_repr = repr(result)[:300]
+        print(f"[firecrawl] map returned {len(urls)} URLs for {base_url} "
+              f"(type={type(result).__name__}, links_attr={hasattr(result, 'links')}, raw={raw_repr})")
 
-        # Filter and score
         scored = [(url, _score_url(url)) for url in urls if isinstance(url, str)]
         scored.sort(key=lambda x: -x[1])
 
@@ -207,17 +206,13 @@ async def scrape_page(url: str) -> str | None:
     Scrape a single page via Firecrawl and return clean markdown content.
     Returns None on failure.
     """
-    app = _get_firecrawl()
+    app = _get_async_firecrawl()
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: app.scrape(url=url, formats=["markdown"])
-        )
+        result = await app.scrape(url=url, formats=["markdown"])
         content = _extract_markdown(result)
         if content and len(content.strip()) >= 50:
             return content
 
-        # If content is empty or very thin, log and return whatever we got.
         print(f"[firecrawl] scrape returned thin/empty content for {url} (type={type(result).__name__})")
         return content if content else None
     except Exception as e:
@@ -230,6 +225,7 @@ async def scrape_pages(urls: list[str]) -> list[dict]:
     Scrape multiple pages in parallel.
     Returns list of {"url": str, "content": str} for pages that succeeded.
     """
+    import asyncio
     tasks = [scrape_page(url) for url in urls]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -353,13 +349,10 @@ def _looks_like_official_website(url: str) -> bool:
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.lower().lstrip("www.")
-        # Reject known directories
         if any(d in domain for d in _DIRECTORY_DOMAINS):
             return False
-        # Prefer official-looking TLDs/patterns
         if any(hint in domain for hint in _OFFICIAL_DOMAIN_HINTS):
             return True
-        # Accept .com only as a last resort — many smaller districts use it
         return True
     except Exception:
         return False
@@ -370,25 +363,17 @@ async def discover_district_website(district_name: str) -> str | None:
     Use Firecrawl search to find the official website for a school district
     when no URL is stored in Pipedrive or the districts table.
 
-    Searches for "[district name] official school district website" and
-    returns the first result URL that looks like an official domain.
-    Returns None if nothing suitable is found.
-
-    Uses Firecrawl search credits — much cheaper than a Claude web search call.
+    Returns the first result URL that looks like an official domain, or None.
     """
-    app = _get_firecrawl()
+    app = _get_async_firecrawl()
     query = f'"{district_name}" official school district website'
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: app.search(query=query, limit=5)
-        )
+        result = await app.search(query=query, limit=5)
 
         for url in _extract_search_urls(result):
             if url and _looks_like_official_website(url):
                 parsed = urlparse(url)
-                # Return just the homepage (scheme + netloc), not a deep subpage
                 homepage = f"{parsed.scheme}://{parsed.netloc}"
                 print(f"[firecrawl] Discovered website for '{district_name}': {homepage}")
                 return homepage
@@ -448,6 +433,7 @@ def _discover_subpage_urls_from_html(raw_html: str, base_url: str, max_urls: int
 
 async def _fetch_pages_direct(urls: list[str]) -> list[dict]:
     """Fetch multiple pages via direct httpx and return content dicts."""
+    import asyncio
     tasks = [_fetch_html(url) for url in urls]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     pages = []
@@ -464,8 +450,8 @@ async def scrape_district(base_url: str) -> list[dict]:
     Full pipeline for a single district:
     1. Use Firecrawl map to discover relevant subpage URLs.
     2. Scrape homepage + top subpages in parallel via Firecrawl.
-    3. If Firecrawl returned nothing, fall back to direct HTML fetching
-       with link-based subpage discovery from the homepage.
+    3. If map found no subpages, fall back to HTML-based link discovery and
+       scrape those pages (Firecrawl first, direct HTTP if that also fails).
     4. Supplement with SchoolInsites direct API if detected.
 
     Returns a list of {"url": str, "content": str} dicts ready to pass
@@ -489,7 +475,6 @@ async def scrape_district(base_url: str) -> list[dict]:
     # homepage was scraped — we still need subpages to find contacts.
     if not subpage_urls:
         print(f"[firecrawl] map found no subpages — using HTML fallback for subpage discovery on {base_url}")
-        # Try to get homepage HTML (reuse Firecrawl markdown if we have it, else fetch directly)
         homepage_html = await _fetch_html(base_url)
 
         if homepage_html and len(homepage_html) > 100:
@@ -499,18 +484,15 @@ async def scrape_district(base_url: str) -> list[dict]:
             print(f"[firecrawl] HTML fallback discovered {len(discovered)} candidate subpage URLs for {base_url}")
 
             if discovered:
-                # First try Firecrawl for these pages (better content quality)
                 fc_subpages = await scrape_pages(discovered)
                 if fc_subpages:
                     print(f"[firecrawl] Firecrawl scraped {len(fc_subpages)} discovered subpages for {base_url}")
                     pages.extend(fc_subpages)
                 else:
-                    # Firecrawl still failing — fetch directly
                     direct_subpages = await _fetch_pages_direct(discovered)
                     print(f"[firecrawl] direct HTTP fetched {len(direct_subpages)} subpages for {base_url}")
                     pages.extend(direct_subpages)
 
-        # If we have no pages at all yet, add homepage via direct fetch
         if not pages:
             homepage_html = homepage_html or await _fetch_html(base_url)
             if homepage_html and len(homepage_html) > 100:
