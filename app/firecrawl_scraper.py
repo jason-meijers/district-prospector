@@ -66,14 +66,14 @@ def _extract_urls_from_map(result: object) -> list[str]:
     def _url_from_item(item: object) -> str | None:
         if isinstance(item, str):
             return item
-        # typed SDK object (e.g. MapResponseLinksItem)
-        if hasattr(item, "url") and isinstance(item.url, str):  # type: ignore[union-attr]
-            return item.url  # type: ignore[union-attr]
+        # typed SDK object (e.g. LinkResult) — url may be Pydantic AnyUrl, not str
+        if hasattr(item, "url") and item.url is not None:  # type: ignore[union-attr]
+            return str(item.url)  # type: ignore[union-attr]
         # plain dict
         if isinstance(item, dict):
             u = item.get("url") or item.get("link") or item.get("href")
-            if isinstance(u, str):
-                return u
+            if u is not None:
+                return str(u)
         return None
 
     # v4 typed object with .links attribute
