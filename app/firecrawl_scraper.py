@@ -50,6 +50,32 @@ def _score_url(url: str) -> int:
     return score
 
 
+def _primary_host_variants(url: str) -> frozenset[str]:
+    """
+    Hosts treated as the same "main" site as the configured URL: bare domain
+    and www only. Excludes other subdomains (e.g. gearup.district.org when
+    base is www.district.org).
+    """
+    netloc = urlparse(url).netloc.lower()
+    if not netloc:
+        return frozenset()
+    if netloc.startswith("www."):
+        bare = netloc[4:]
+        return frozenset({netloc, bare})
+    return frozenset({netloc, f"www.{netloc}"})
+
+
+def _url_matches_configured_site(url: str, base_url: str) -> bool:
+    """True if URL hostname is the same primary site as base_url (www optional)."""
+    try:
+        u_host = urlparse(url).netloc.lower()
+        if not u_host:
+            return False
+        return u_host in _primary_host_variants(base_url)
+    except Exception:
+        return False
+
+
 def _get_async_firecrawl():
     """Return an initialised AsyncFirecrawl client (v4+ SDK)."""
     settings = get_settings()
@@ -234,6 +260,14 @@ async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]
                 continue
             branch_counts[branch] = branch_counts.get(branch, 0) + 1
             filtered.append(url)
+
+        before_host = len(filtered)
+        filtered = [u for u in filtered if _url_matches_configured_site(u, base_url)]
+        if before_host > len(filtered):
+            print(
+                f"[firecrawl] dropped {before_host - len(filtered)} map URLs not on primary host "
+                f"of {base_url} (e.g. other subdomains)"
+            )
 
         print(f"[firecrawl] {len(filtered)} URLs after filtering/dedup for {base_url}")
         return filtered[:limit]
@@ -522,8 +556,12 @@ async def scrape_district(base_url: str) -> list[dict]:
     # Step 1: discover target URLs via Firecrawl map
     subpage_urls = await discover_urls(base_url, max_urls=settings.batch_max_target_pages)
 
-    # Always include homepage; deduplicate
-    all_urls = [base_url] + [u for u in subpage_urls if u.rstrip("/") != base_url.rstrip("/")]
+    # Always include homepage; deduplicate. Keep only the configured primary host
+    # (www vs non-www), never sibling subdomains from map (not cache — map/sitemap).
+    all_urls = [base_url] + [
+        u for u in subpage_urls
+        if u.rstrip("/") != base_url.rstrip("/") and _url_matches_configured_site(u, base_url)
+    ]
 
     # Step 2: scrape all pages in parallel via Firecrawl
     pages = await scrape_pages(all_urls)
