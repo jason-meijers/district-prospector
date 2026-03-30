@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import re
 import time
 import anthropic
 from app.config import get_settings
@@ -58,6 +59,14 @@ SKIP any person whose title explicitly references:
 For each contact assign the BEST matching role_category_id from this list:
 {BATCH_ROLE_OPTIONS.strip()}
 
+## District main phone (board office / district switchboard)
+
+District sites almost always show one main phone in the header, footer, or contact block (e.g. \"Phone: 555-123-4567\", \"Central Office\", \"District Office\").
+
+1. Set JSON field `district_main_phone` to that single main district/switchboard number in **###-###-####** form (US), or `null` if truly not visible anywhere in the content.
+2. For **each contact**, if the site does **not** list a **direct** phone for that person, set `phone` to `district_main_phone` (when not null). If they **do** have their own extension/number, keep that personal number in `phone`.
+3. Only use numbers that clearly belong to the **district or central office**, not random numbers from news stories or unrelated sponsors.
+
 ## Email Pattern Detection
 
 When you find email addresses, detect the pattern (e.g. firstinitial+last@domain.org). Apply it to contacts without a listed email. Track confidence:
@@ -71,6 +80,7 @@ When you find email addresses, detect the pattern (e.g. firstinitial+last@domain
 Return ONLY valid JSON — no markdown, no explanation.
 
 {{
+  "district_main_phone": "string ###-###-#### or null — district / central office main line from the site",
   "contacts": [
     {{
       "name": "string — full name as shown on site",
@@ -79,7 +89,7 @@ Return ONLY valid JSON — no markdown, no explanation.
       "role_category_id": 482,
       "email": "string or null",
       "email_confidence": "confirmed|high|medium|low",
-      "phone": "string or null",
+      "phone": "string — personal direct line if shown, otherwise district_main_phone, or null",
       "source_url": "string — URL where this person was found"
     }}
   ],
@@ -92,6 +102,36 @@ Return ONLY valid JSON — no markdown, no explanation.
 }}
 
 IMPORTANT: Only return real human names. Never treat page labels, navigation items, department names, or image descriptions as person names."""
+
+_PHONE_NEAR_LABEL = re.compile(
+    r"(?:phone|telephone|tel\.?|district\s+office|central\s+office|main\s+office|board\s+office)\s*[:\s]+"
+    r"\(?([2-9]\d{2})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})",
+    re.I,
+)
+
+
+def _normalize_us_phone_str(raw: str) -> str | None:
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    if len(digits) == 11 and digits.startswith("1"):
+        d = digits[1:]
+        return f"{d[:3]}-{d[3:6]}-{d[6:]}"
+    return None
+
+
+def _guess_district_phone_from_pages(pages: list[dict]) -> str | None:
+    """If Claude omits district_main_phone, find a labeled main line in scraped text."""
+    parts: list[str] = []
+    for p in pages[:8]:
+        parts.append((p.get("content") or "")[:12000])
+    chunk = "\n".join(parts)
+    if not chunk.strip():
+        return None
+    m = _PHONE_NEAR_LABEL.search(chunk)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return None
 
 
 class BatchExtractionAgent:
@@ -232,6 +272,22 @@ class BatchExtractionAgent:
                 print(f"[batch_agent] Skipping UI label as name: '{name}'")
                 continue
             clean_contacts.append(c)
+
+        district_phone = (result.get("district_main_phone") or "").strip()
+        district_phone = _normalize_us_phone_str(district_phone) if district_phone else None
+        if not district_phone:
+            district_phone = _guess_district_phone_from_pages(pages)
+
+        if district_phone:
+            backfill = 0
+            for c in clean_contacts:
+                if not (c.get("phone") or "").strip():
+                    c["phone"] = district_phone
+                    backfill += 1
+            if backfill:
+                print(
+                    f"[batch_agent] Filled {backfill} missing phone(s) with district main line {district_phone}"
+                )
 
         print(
             f"[batch_agent] Extracted {len(clean_contacts)} contacts for {org_name} "
