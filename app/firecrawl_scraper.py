@@ -181,11 +181,11 @@ async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]
     try:
         result = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: app.map(base_url, limit=fetch_limit, search=_MAP_SEARCH_TERMS)
+            lambda: app.map(url=base_url, limit=fetch_limit)
         )
 
         urls = _extract_urls_from_map(result)
-        print(f"[firecrawl] map returned {len(urls)} URLs for {base_url} (type={type(result).__name__})")
+        print(f"[firecrawl] map returned {len(urls)} URLs for {base_url} (type={type(result).__name__}, links_attr={hasattr(result, 'links')})")
 
         # Filter and score
         scored = [(url, _score_url(url)) for url in urls if isinstance(url, str)]
@@ -209,7 +209,7 @@ async def scrape_page(url: str) -> str | None:
     try:
         result = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: app.scrape(url, formats=["markdown"])
+            lambda: app.scrape(url=url, formats=["markdown"])
         )
         content = _extract_markdown(result)
         if content and len(content.strip()) >= 50:
@@ -380,7 +380,7 @@ async def discover_district_website(district_name: str) -> str | None:
     try:
         result = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: app.search(query, limit=5)
+            lambda: app.search(query=query, limit=5)
         )
 
         for url in _extract_search_urls(result):
