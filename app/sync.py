@@ -5,27 +5,12 @@ from supabase import create_client
 from app.config import get_settings, PIPEDRIVE_WEBSITE_FIELD_KEY, PIPEDRIVE_DISTRICT_NAME_FIELD_KEY
 from app.database import _normalize_name
 
-# Only sync persons in roles we care about — keeps the snapshot table
-# focused and prevents noise from irrelevant contacts.
-_TARGET_ROLE_IDS = {
-    482,  # Superintendent
-    468,  # Assistant Superintendent
-    472,  # Curriculum Director
-    623,  # Curriculum Coordinator
-    471,  # CTE Director
-    467,  # Assistant CTE Director
-    470,  # CTE Coordinator
-    480,  # Principal
-    474,  # Director
-    478,  # Other
-}
-
 PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY = "7f22b8624616bef2d0adce26b28f8b3055dcbaae"
 
 
 async def sync_pipedrive_contacts() -> dict:
     """
-    Nightly sync: fetch all active Pipedrive persons in target roles and
+    Nightly sync: fetch all active Pipedrive persons and
     upsert them into the pipedrive_contacts_snapshot table.
 
     Clears the snapshot first and rebuilds from scratch each run —
@@ -47,30 +32,27 @@ async def sync_pipedrive_contacts() -> dict:
     persons = await _fetch_all_persons(base_url, token)
     print(f"[sync] Fetched {len(persons)} total persons from Pipedrive")
 
-    # Filter to target roles only
-    target_persons = []
+    # Keep all active, non-deleted contacts so dedup checks are as safe
+    # as possible even when role_category is missing or inconsistent.
+    snapshot_persons = []
     for p in persons:
         if not p.get("active_flag", True):
             continue
         if p.get("deleted") or p.get("archived") or p.get("merge_into_id"):
             continue
 
-        role_id = _extract_role_id(p)
-        if role_id not in _TARGET_ROLE_IDS:
-            continue
+        snapshot_persons.append(p)
 
-        target_persons.append(p)
-
-    print(f"[sync] {len(target_persons)} persons match target roles")
+    print(f"[sync] {len(snapshot_persons)} active persons eligible for snapshot")
 
     # Clear old snapshot and rebuild
     db.table("pipedrive_contacts_snapshot").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
 
-    if not target_persons:
+    if not snapshot_persons:
         return {"total_fetched": len(persons), "synced": 0}
 
     records = []
-    for p in target_persons:
+    for p in snapshot_persons:
         org = p.get("org_id")
         org_id = org.get("value") if isinstance(org, dict) else org
 
