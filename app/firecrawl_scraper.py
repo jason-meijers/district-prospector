@@ -192,8 +192,22 @@ async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]
         scored = [(url, _score_url(url)) for url in urls if isinstance(url, str)]
         scored.sort(key=lambda x: -x[1])
 
-        filtered = [url for url, score in scored if score >= -1]
-        print(f"[firecrawl] {len(filtered)} URLs after filtering for {base_url}")
+        # Keep only URLs with a non-negative score, then apply path diversity:
+        # limit each second-level path prefix to at most 2 URLs so a single
+        # department branch can't consume all available slots.
+        filtered: list[str] = []
+        branch_counts: dict[str, int] = {}
+        for url, score in scored:
+            if score < -1:
+                continue
+            parts = urlparse(url).path.strip("/").split("/")
+            branch = "/".join(parts[:2]) if len(parts) >= 2 else parts[0] if parts else ""
+            if branch_counts.get(branch, 0) >= 2:
+                continue
+            branch_counts[branch] = branch_counts.get(branch, 0) + 1
+            filtered.append(url)
+
+        print(f"[firecrawl] {len(filtered)} URLs after filtering/dedup for {base_url}")
         return filtered[:limit]
 
     except Exception as e:

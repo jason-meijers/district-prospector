@@ -117,7 +117,7 @@ class Settings(BaseSettings):
     # How many districts to process in parallel per batch run
     batch_concurrency: int = 10
     # Max distinct target URLs to scrape per district (not counting pagination within a directory)
-    batch_max_target_pages: int = 5
+    batch_max_target_pages: int = 15
     # Max characters to pass to Claude per page (controls token cost)
     batch_chars_per_page: int = 4000
 
