@@ -440,6 +440,12 @@ class ApproveContactsRequest(BaseModel):
     new_contact_ids: list[str]
 
 
+class BatchTestUrlRequest(BaseModel):
+    website_url: str
+    org_name: str = "Manual test district"
+    run_extract: bool = True
+
+
 async def _run_batch_background(limit: int, run_dedup: bool) -> None:
     from app.batch_runner import run_batch
     try:
@@ -566,6 +572,66 @@ async def approve_contacts(payload: ApproveContactsRequest, background_tasks: Ba
         return {"status": "ok", "queued": 0}
     background_tasks.add_task(_write_approved_to_pipedrive, payload.new_contact_ids)
     return {"status": "accepted", "queued": len(payload.new_contact_ids)}
+
+
+@app.post("/batch/test-url")
+async def batch_test_url(payload: BatchTestUrlRequest):
+    """
+    Manual test helper: scrape a single website URL and optionally run
+    extraction, without touching districts queue/status tables.
+    """
+    settings = get_settings()
+    if not settings.firecrawl_api_key:
+        raise HTTPException(status_code=503, detail="FIRECRAWL_API_KEY not configured")
+
+    try:
+        from app.firecrawl_scraper import scrape_district
+
+        pages = await scrape_district(payload.website_url)
+        page_urls = [p.get("url") for p in pages if p.get("url")]
+        page_lengths = [
+            {"url": p.get("url"), "chars": len((p.get("content") or ""))}
+            for p in pages
+        ]
+
+        if not payload.run_extract:
+            return {
+                "status": "ok",
+                "website_url": payload.website_url,
+                "pages_scraped": len(pages),
+                "page_urls": page_urls,
+                "page_lengths": page_lengths,
+                "contacts_found": 0,
+                "contacts": [],
+                "token_usage": {},
+            }
+
+        if not settings.anthropic_api_key:
+            raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+
+        from app.batch_agent import BatchExtractionAgent
+        agent = BatchExtractionAgent()
+        contacts, email_pattern, usage = agent.extract_contacts_raw(
+            pages=pages,
+            org_name=payload.org_name,
+            website_url=payload.website_url,
+        )
+
+        return {
+            "status": "ok",
+            "website_url": payload.website_url,
+            "pages_scraped": len(pages),
+            "page_urls": page_urls,
+            "page_lengths": page_lengths,
+            "contacts_found": len(contacts),
+            "contacts": contacts,
+            "email_pattern": email_pattern,
+            "token_usage": usage,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
 async def _write_approved_to_pipedrive(new_contact_ids: list[str]) -> None:
