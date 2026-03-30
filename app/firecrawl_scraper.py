@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio
 import httpx
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from firecrawl import FirecrawlApp
 from app.config import get_settings
 
@@ -405,12 +405,72 @@ async def discover_district_website(district_name: str) -> str | None:
         return None
 
 
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+async def _fetch_html(url: str, timeout: int = 15) -> str | None:
+    """Fetch raw HTML from a URL using a browser user-agent."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": _BROWSER_UA})
+            resp.raise_for_status()
+            return resp.text or None
+    except Exception as e:
+        print(f"[firecrawl] direct fetch failed for {url}: {type(e).__name__}: {e}")
+        return None
+
+
+def _discover_subpage_urls_from_html(raw_html: str, base_url: str, max_urls: int = 10) -> list[str]:
+    """
+    Parse homepage HTML for internal links and return the top candidates
+    likely to contain staff/leadership contact info. Used as fallback when
+    Firecrawl map returns nothing.
+    """
+    soup = BeautifulSoup(raw_html, "html.parser")
+    base_domain = urlparse(base_url).netloc
+    links: set[str] = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:"):
+            continue
+        full_url = urljoin(base_url, href)
+        parsed = urlparse(full_url)
+        if base_domain in parsed.netloc or parsed.netloc in base_domain:
+            clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+            links.add(clean_url)
+
+    scored = [(url, _score_url(url)) for url in links]
+    scored.sort(key=lambda x: -x[1])
+    filtered = [url for url, score in scored if score >= 0]
+    return filtered[:max_urls]
+
+
+async def _fetch_pages_direct(urls: list[str]) -> list[dict]:
+    """Fetch multiple pages via direct httpx and return content dicts."""
+    tasks = [_fetch_html(url) for url in urls]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    pages = []
+    for url, content in zip(urls, results):
+        if isinstance(content, Exception):
+            continue
+        if content and len(content) > 100:
+            pages.append({"url": url, "content": content})
+    return pages
+
+
 async def scrape_district(base_url: str) -> list[dict]:
     """
     Full pipeline for a single district:
     1. Use Firecrawl map to discover relevant subpage URLs.
     2. Scrape homepage + top subpages in parallel via Firecrawl.
-    3. Supplement with SchoolInsites direct API if detected.
+    3. If Firecrawl returned nothing, fall back to direct HTML fetching
+       with link-based subpage discovery from the homepage.
+    4. Supplement with SchoolInsites direct API if detected.
 
     Returns a list of {"url": str, "content": str} dicts ready to pass
     to the batch extraction agent.
@@ -418,41 +478,40 @@ async def scrape_district(base_url: str) -> list[dict]:
     settings = get_settings()
     print(f"[firecrawl] Starting scrape for {base_url}")
 
-    # Step 1: discover target URLs
+    # Step 1: discover target URLs via Firecrawl map
     subpage_urls = await discover_urls(base_url, max_urls=settings.batch_max_target_pages)
 
     # Always include homepage; deduplicate
     all_urls = [base_url] + [u for u in subpage_urls if u.rstrip("/") != base_url.rstrip("/")]
 
-    # Step 2: scrape all pages in parallel
+    # Step 2: scrape all pages in parallel via Firecrawl
     pages = await scrape_pages(all_urls)
     print(f"[firecrawl] Scraped {len(pages)} pages for {base_url}")
 
-    # Fallback: if Firecrawl produced nothing, fetch homepage directly.
-    # This keeps the pipeline moving on sites where map/scrape APIs return
-    # empty payloads despite the site being reachable.
+    # Step 3: if Firecrawl produced nothing, fall back to direct HTML fetching
     if not pages:
-        try:
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                resp = await client.get(base_url, headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    )
-                })
-                resp.raise_for_status()
-                html = resp.text or ""
-                if len(html) > 100:
-                    pages.append({"url": f"{base_url} [direct_html_fallback]", "content": html})
-                    print(f"[firecrawl] Added direct HTML fallback content for {base_url} ({len(html)} chars)")
-        except Exception as e:
-            print(f"[firecrawl] Direct HTML fallback failed for {base_url}: {type(e).__name__}: {e}")
+        print(f"[firecrawl] Firecrawl returned 0 pages — falling back to direct HTML fetch for {base_url}")
+        homepage_html = await _fetch_html(base_url)
 
-    # Step 3: SchoolInsites supplement (check homepage)
+        if homepage_html and len(homepage_html) > 100:
+            # Discover subpage URLs from homepage links
+            discovered = _discover_subpage_urls_from_html(
+                homepage_html, base_url, max_urls=settings.batch_max_target_pages
+            )
+            print(f"[firecrawl] HTML fallback discovered {len(discovered)} candidate subpage URLs for {base_url}")
+
+            # Fetch subpages directly
+            if discovered:
+                subpages = await _fetch_pages_direct(discovered)
+                pages.extend(subpages)
+                print(f"[firecrawl] HTML fallback fetched {len(subpages)} subpages for {base_url}")
+
+            # Also include homepage itself
+            pages.append({"url": f"{base_url} [direct_fallback]", "content": homepage_html})
+
+    # Step 4: SchoolInsites supplement (check homepage)
     si_text = await _fetch_schoolinsites_directory(base_url)
     if si_text:
-        # Prepend as a synthetic page so Claude sees it first
         pages.insert(0, {"url": f"{base_url} [SchoolInsites API]", "content": si_text})
 
     return pages
