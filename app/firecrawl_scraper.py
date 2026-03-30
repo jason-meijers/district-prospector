@@ -55,6 +55,74 @@ def _get_firecrawl() -> FirecrawlApp:
     return FirecrawlApp(api_key=settings.firecrawl_api_key)
 
 
+def _extract_result_urls(result: object) -> list[str]:
+    """Normalize Firecrawl map/search payloads into URL strings."""
+    if isinstance(result, dict):
+        candidates = result.get("links") or result.get("urls") or result.get("data") or result.get("results") or []
+    elif isinstance(result, list):
+        candidates = result
+    else:
+        candidates = []
+
+    urls: list[str] = []
+    for item in candidates:
+        if isinstance(item, str):
+            urls.append(item)
+        elif isinstance(item, dict):
+            url = item.get("url") or item.get("link") or item.get("href")
+            if isinstance(url, str):
+                urls.append(url)
+    return urls
+
+
+def _extract_markdown(result: object) -> str | None:
+    """Normalize Firecrawl scrape payloads into markdown text."""
+    if isinstance(result, dict):
+        return result.get("markdown") or result.get("content") or result.get("text") or None
+    if isinstance(result, str):
+        return result
+    return None
+
+
+def _call_firecrawl_map(app: FirecrawlApp, base_url: str, search: str, limit: int) -> object:
+    """
+    Call Firecrawl map with SDK compatibility across method/arg variants.
+    """
+    if hasattr(app, "map_url"):
+        return app.map_url(base_url, params={"search": search, "limit": limit})
+    if hasattr(app, "map"):
+        try:
+            return app.map(base_url, params={"search": search, "limit": limit})
+        except TypeError:
+            return app.map(base_url, search=search, limit=limit)
+    raise AttributeError("Firecrawl client has neither map_url nor map method")
+
+
+def _call_firecrawl_scrape(app: FirecrawlApp, url: str) -> object:
+    """
+    Call Firecrawl scrape with SDK compatibility across method/arg variants.
+    """
+    params = {"formats": ["markdown"], "onlyMainContent": True}
+    if hasattr(app, "scrape_url"):
+        return app.scrape_url(url, params=params)
+    if hasattr(app, "scrape"):
+        try:
+            return app.scrape(url, params=params)
+        except TypeError:
+            return app.scrape(url, formats=["markdown"], only_main_content=True)
+    raise AttributeError("Firecrawl client has neither scrape_url nor scrape method")
+
+
+def _call_firecrawl_search(app: FirecrawlApp, query: str, limit: int) -> object:
+    """
+    Call Firecrawl search with SDK compatibility for params/kwargs styles.
+    """
+    try:
+        return app.search(query, params={"limit": limit})
+    except TypeError:
+        return app.search(query, limit=limit)
+
+
 async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]:
     """
     Use Firecrawl's map endpoint with a staff-focused search term to discover
@@ -73,22 +141,15 @@ async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]
         # block the async event loop.
         result = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: app.map_url(
+            lambda: _call_firecrawl_map(
+                app,
                 base_url,
-                params={
-                    "search": _MAP_SEARCH_TERMS,
-                    "limit": min(limit * 8, 50),  # fetch extra, then filter
-                }
+                _MAP_SEARCH_TERMS,
+                min(limit * 8, 50),  # fetch extra, then filter
             )
         )
 
-        # Firecrawl returns a list of URLs directly or wrapped in a dict
-        if isinstance(result, dict):
-            urls = result.get("links") or result.get("urls") or []
-        elif isinstance(result, list):
-            urls = result
-        else:
-            urls = []
+        urls = _extract_result_urls(result)
 
         # Filter and score
         scored = [(url, _score_url(url)) for url in urls if isinstance(url, str)]
@@ -113,17 +174,9 @@ async def scrape_page(url: str) -> str | None:
     try:
         result = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: app.scrape_url(
-                url,
-                params={
-                    "formats": ["markdown"],
-                    "onlyMainContent": True,
-                }
-            )
+            lambda: _call_firecrawl_scrape(app, url)
         )
-        if isinstance(result, dict):
-            return result.get("markdown") or result.get("content") or None
-        return str(result) if result else None
+        return _extract_markdown(result)
     except Exception as e:
         print(f"[firecrawl] scrape failed for {url}: {type(e).__name__}: {e}")
         return None
@@ -281,23 +334,10 @@ async def discover_district_website(district_name: str) -> str | None:
     try:
         result = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: app.search(query, params={"limit": 5})
+            lambda: _call_firecrawl_search(app, query, 5)
         )
 
-        # Firecrawl search returns a list of result dicts with a "url" key
-        results = []
-        if isinstance(result, dict):
-            results = result.get("data") or result.get("results") or []
-        elif isinstance(result, list):
-            results = result
-
-        for item in results:
-            url = None
-            if isinstance(item, dict):
-                url = item.get("url") or item.get("link")
-            elif isinstance(item, str):
-                url = item
-
+        for url in _extract_result_urls(result):
             if url and _looks_like_official_website(url):
                 parsed = urlparse(url)
                 # Return just the homepage (scheme + netloc), not a deep subpage
