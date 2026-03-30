@@ -69,11 +69,20 @@ District sites almost always show one main phone in the header, footer, or conta
 
 ## Email Pattern Detection
 
-When you find email addresses, detect the pattern (e.g. firstinitial+last@domain.org). Apply it to contacts without a listed email. Track confidence:
-- "confirmed" = email explicitly shown for this person
-- "high" = pattern from 2+ confirmed emails, applied here
-- "medium" = pattern from 1 confirmed email
-- "low" = no pattern found
+In `email_pattern`:
+- `examples_found`: list every district-staff email you see in the content (helps verify the rule).
+- `confidence`:
+  - **high** = the same local-part rule is obvious from **2+** staff emails on the district domain
+  - **medium** = **1** clear staff email on the district domain shows the rule
+  - **low** = no reliable pattern; do not guess addresses
+
+Per-contact `email` / `email_confidence`:
+- **confirmed** = that exact address appears next to this person's name on the site
+- **high** or **medium** = you **applied the pattern** to build their address (must match `email_pattern.confidence`)
+
+**Mandatory:** If `email_pattern.confidence` is **high** or **medium**, **no contact may have `email: null`**. You must apply the pattern to build `email` for anyone missing a printed address, and set their `email_confidence` to **high** or **medium** (same tier as the pattern, or **high** when the pattern is **high**).
+
+If you are not sure enough to fill everyone, you must set `email_pattern.confidence` to **low** instead.
 
 ## Output Format
 
@@ -132,6 +141,220 @@ def _guess_district_phone_from_pages(pages: list[dict]) -> str | None:
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     return None
+
+
+def _normalize_contact_phone(raw: str | None) -> str | None:
+    """
+    Normalize phone to ###-###-####; preserve extension as ' x1234' when present.
+    Returns None if empty; returns original stripped string if not a US 10/11 digit core.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    ext_m = re.search(r"(?:\s*(?:x|ext\.?)\s*)(\d{1,6})\s*$", s, re.I)
+    ext = ext_m.group(1) if ext_m else None
+    core = s[: ext_m.start()].strip() if ext_m else s
+    normalized = _normalize_us_phone_str(core)
+    if not normalized:
+        return s
+    return f"{normalized} x{ext}" if ext else normalized
+
+
+def _name_parts_for_email(name: str) -> tuple[str, str]:
+    """Given display name, return (first_token, last_token) lowercased, letters only in tokens."""
+    s = (name or "").strip()
+    s = re.sub(r",\s*(Ph\.?D\.?|Ed\.?D\.?|Jr\.?|Sr\.?|III|II|IV|M\.?D\.?|Esq\.?).*$", "", s, flags=re.I)
+    s = re.sub(r"^(Dr\.?|Mr\.?|Mrs\.?|Ms\.?|Prof\.?)\s+", "", s, flags=re.I)
+    parts = re.findall(r"[A-Za-z][A-Za-z'\-]*", s)
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0].lower(), ""
+    return parts[0].lower(), parts[-1].lower()
+
+
+def _email_formulas():
+    """(label, fn(first,last)->local). Order: try more specific rules when learning from pairs."""
+
+    def fi_l(first: str, last: str) -> str | None:
+        return f"{first[0]}{last}" if first and last else None
+
+    def l_fi(first: str, last: str) -> str | None:
+        return f"{last}{first[0]}" if first and last else None
+
+    def fi_dot_l(first: str, last: str) -> str | None:
+        return f"{first[0]}.{last}" if first and last else None
+
+    def f_dot_l(first: str, last: str) -> str | None:
+        return f"{first}.{last}" if first and last else None
+
+    def flast(first: str, last: str) -> str | None:
+        return f"{first}{last}" if first and last else None
+
+    def l_dot_fi(first: str, last: str) -> str | None:
+        return f"{last}.{first[0]}" if first and last else None
+
+    def l_f2(first: str, last: str) -> str | None:
+        return f"{last}{first[0:2]}" if first and last and len(first) >= 2 else None
+
+    def f2_l(first: str, last: str) -> str | None:
+        return f"{first[0:2]}{last}" if first and last and len(first) >= 2 else None
+
+    def l_f2i(first: str, last: str) -> str | None:
+        """e.g. Jenny Johnson -> johnsonje"""
+        return f"{last}{first[0]}{first[1]}" if first and last and len(first) >= 2 else None
+
+    def l_f3(first: str, last: str) -> str | None:
+        return f"{last}{first[0:3]}" if first and last and len(first) >= 3 else None
+
+    return (
+        ("l_f2i", l_f2i),
+        ("l_f3", l_f3),
+        ("l_f2", l_f2),
+        ("f2_l", f2_l),
+        ("fi_l", fi_l),
+        ("l_fi", l_fi),
+        ("f_dot_l", f_dot_l),
+        ("fi_dot_l", fi_dot_l),
+        ("l_dot_fi", l_dot_fi),
+        ("flast", flast),
+    )
+
+
+def _learn_email_local_formula(
+    pairs: list[tuple[str, str]],
+    pattern_hint: str | None,
+) -> tuple[str, callable] | None:
+    """
+    Find the one formula that maps every (name, local) pair to the same local part.
+    pairs: (display_name, email_local_lower)
+    Returns (formula_key, fn(first,last)->str|None).
+    """
+    if not pairs:
+        return None
+    hint = (pattern_hint or "").lower()
+    formulas = list(_email_formulas())
+    matching: list[tuple[str, callable]] = []
+    for label, fn in formulas:
+        ok = True
+        for name, loc in pairs:
+            first, last = _name_parts_for_email(name)
+            try:
+                pred = fn(first, last)
+            except Exception:
+                ok = False
+                break
+            if pred is None or pred.lower() != loc.lower():
+                ok = False
+                break
+        if ok:
+            matching.append((label, fn))
+    if len(matching) == 1:
+        return matching[0]
+    if len(matching) > 1 and hint:
+        for label, fn in matching:
+            if label.replace("_", "") in hint.replace("+", "").replace(" ", "") or label in hint:
+                return (label, fn)
+        if "first" in hint and "initial" in hint and "last" in hint:
+            for label, fn in matching:
+                if label.startswith("fi_l") or label == "fi_dot_l":
+                    return (label, fn)
+        if "last" in hint and "first" in hint:
+            for label, fn in matching:
+                if label.startswith("l_f"):
+                    return (label, fn)
+    return None
+
+
+def _email_domain_for_inference(email_pattern: dict, contacts: list[dict]) -> str | None:
+    for ex in email_pattern.get("examples_found") or []:
+        if isinstance(ex, str) and "@" in ex.strip():
+            return ex.strip().split("@", 1)[1].lower()
+    for c in contacts:
+        e = (c.get("email") or "").strip()
+        if "@" in e:
+            return e.rsplit("@", 1)[-1].lower()
+    return None
+
+
+def _pairs_from_contacts_for_learning(contacts: list[dict], domain: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    dlow = domain.lower()
+    for c in contacts:
+        name = (c.get("name") or "").strip()
+        e = (c.get("email") or "").strip().lower()
+        if not name or "@" not in e:
+            continue
+        loc, dom = e.rsplit("@", 1)
+        if dom != dlow:
+            continue
+        pairs.append((name, loc))
+    return pairs
+
+
+def _backfill_emails_from_pattern(contacts: list[dict], email_pattern: dict) -> int:
+    """
+    When Claude set pattern confidence high/medium but left emails null, learn the
+    local-part rule from contacts who have an address on the same domain and apply it.
+    """
+    conf = (email_pattern.get("confidence") or "low").lower()
+    examples = email_pattern.get("examples_found") or []
+    if conf not in ("high", "medium"):
+        return 0
+    if conf == "medium" and len(examples) < 1 and not any(
+        (c.get("email") or "").strip() for c in contacts
+    ):
+        return 0
+
+    domain = _email_domain_for_inference(email_pattern, contacts)
+    if not domain:
+        return 0
+
+    pairs = _pairs_from_contacts_for_learning(contacts, domain)
+    learned = _learn_email_local_formula(pairs, email_pattern.get("pattern"))
+    if not learned:
+        if conf == "high" and len(examples) >= 2:
+            print(
+                "[batch_agent] email_pattern high but could not learn formula from contacts "
+                f"(pairs={len(pairs)}, examples={len(examples)})"
+            )
+        return 0
+
+    label, fn = learned
+    filled = 0
+    infer_conf = "high" if conf == "high" or len(pairs) >= 2 else "medium"
+    for c in contacts:
+        if (c.get("email") or "").strip():
+            continue
+        first, last = _name_parts_for_email(c.get("name") or "")
+        local = fn(first, last)
+        if not local:
+            continue
+        c["email"] = f"{local.lower()}@{domain}"
+        c["email_confidence"] = infer_conf
+        filled += 1
+    if filled:
+        print(f"[batch_agent] Inferred {filled} email(s) using learned formula ({label}) @ {domain}")
+    return filled
+
+
+def _normalize_all_contact_phones(contacts: list[dict]) -> None:
+    for c in contacts:
+        raw = c.get("phone")
+        if raw is None or raw == "":
+            continue
+        n = _normalize_contact_phone(raw)
+        if n:
+            c["phone"] = n
+
+
+def _normalize_all_contact_emails(contacts: list[dict]) -> None:
+    for c in contacts:
+        e = c.get("email")
+        if isinstance(e, str) and e.strip():
+            c["email"] = e.strip().lower()
 
 
 class BatchExtractionAgent:
@@ -288,6 +511,10 @@ class BatchExtractionAgent:
                 print(
                     f"[batch_agent] Filled {backfill} missing phone(s) with district main line {district_phone}"
                 )
+
+        _backfill_emails_from_pattern(clean_contacts, email_pattern)
+        _normalize_all_contact_emails(clean_contacts)
+        _normalize_all_contact_phones(clean_contacts)
 
         print(
             f"[batch_agent] Extracted {len(clean_contacts)} contacts for {org_name} "
