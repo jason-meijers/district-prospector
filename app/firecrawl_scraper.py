@@ -57,12 +57,18 @@ def _get_firecrawl() -> FirecrawlApp:
 
 def _extract_result_urls(result: object) -> list[str]:
     """Normalize Firecrawl map/search payloads into URL strings."""
+    candidates = []
     if isinstance(result, dict):
-        candidates = result.get("links") or result.get("urls") or result.get("data") or result.get("results") or []
+        # Common top-level shapes
+        candidates = result.get("links") or result.get("urls") or result.get("results") or []
+        # Nested SDK/API shapes
+        if not candidates and isinstance(result.get("data"), dict):
+            data = result["data"]
+            candidates = data.get("links") or data.get("urls") or data.get("results") or []
+        elif not candidates and isinstance(result.get("data"), list):
+            candidates = result["data"]
     elif isinstance(result, list):
         candidates = result
-    else:
-        candidates = []
 
     urls: list[str] = []
     for item in candidates:
@@ -78,7 +84,12 @@ def _extract_result_urls(result: object) -> list[str]:
 def _extract_markdown(result: object) -> str | None:
     """Normalize Firecrawl scrape payloads into markdown text."""
     if isinstance(result, dict):
-        return result.get("markdown") or result.get("content") or result.get("text") or None
+        direct = result.get("markdown") or result.get("content") or result.get("text")
+        if direct:
+            return direct
+        data = result.get("data")
+        if isinstance(data, dict):
+            return data.get("markdown") or data.get("content") or data.get("text") or None
     if isinstance(result, str):
         return result
     return None
@@ -109,7 +120,29 @@ def _call_firecrawl_scrape(app: FirecrawlApp, url: str) -> object:
         try:
             return app.scrape(url, params=params)
         except TypeError:
-            return app.scrape(url, formats=["markdown"], only_main_content=True)
+            try:
+                return app.scrape(url, formats=["markdown"], only_main_content=True)
+            except TypeError:
+                return app.scrape(url, formats=["markdown"], onlyMainContent=True)
+    raise AttributeError("Firecrawl client has neither scrape_url nor scrape method")
+
+
+def _call_firecrawl_scrape_full(app: FirecrawlApp, url: str) -> object:
+    """
+    Fallback scrape mode with main-content filtering disabled to avoid
+    over-pruning on some district CMS templates.
+    """
+    params = {"formats": ["markdown"], "onlyMainContent": False}
+    if hasattr(app, "scrape_url"):
+        return app.scrape_url(url, params=params)
+    if hasattr(app, "scrape"):
+        try:
+            return app.scrape(url, params=params)
+        except TypeError:
+            try:
+                return app.scrape(url, formats=["markdown"], only_main_content=False)
+            except TypeError:
+                return app.scrape(url, formats=["markdown"], onlyMainContent=False)
     raise AttributeError("Firecrawl client has neither scrape_url nor scrape method")
 
 
@@ -150,6 +183,8 @@ async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]
         )
 
         urls = _extract_result_urls(result)
+        if isinstance(result, dict):
+            print(f"[firecrawl] map raw keys for {base_url}: {list(result.keys())[:10]}")
 
         # Filter and score
         scored = [(url, _score_url(url)) for url in urls if isinstance(url, str)]
@@ -176,7 +211,19 @@ async def scrape_page(url: str) -> str | None:
             None,
             lambda: _call_firecrawl_scrape(app, url)
         )
-        return _extract_markdown(result)
+        content = _extract_markdown(result)
+        if content and len(content.strip()) >= 50:
+            return content
+
+        # Fallback: retry without main-content-only pruning.
+        fallback_result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _call_firecrawl_scrape_full(app, url)
+        )
+        fallback_content = _extract_markdown(fallback_result)
+        if fallback_content:
+            return fallback_content
+        return content
     except Exception as e:
         print(f"[firecrawl] scrape failed for {url}: {type(e).__name__}: {e}")
         return None
@@ -191,12 +238,17 @@ async def scrape_pages(urls: list[str]) -> list[dict]:
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     pages = []
+    dropped_short = 0
     for url, content in zip(urls, results):
         if isinstance(content, Exception):
             print(f"[firecrawl] scrape error for {url}: {content}")
             continue
-        if content and len(content) > 100:
+        if content and len(content) > 30:
             pages.append({"url": url, "content": content})
+        elif content:
+            dropped_short += 1
+    if dropped_short:
+        print(f"[firecrawl] dropped {dropped_short} short pages (<31 chars)")
     return pages
 
 
