@@ -277,14 +277,59 @@ async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]
         return []
 
 
+def _html_to_plaintext_for_agent(html: str, max_chars: int = 80_000) -> str:
+    """Strip tags for Claude when Firecrawl times out; staff lists are often in static HTML."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
+        tag.decompose()
+    text = soup.get_text("\n", strip=True)
+    if len(text) > max_chars:
+        text = text[:max_chars]
+    return text
+
+
+async def _direct_http_scrape_fallback(url: str) -> str | None:
+    """Last resort: fetch HTML and extract visible text (no JS execution)."""
+    html = await _fetch_html(url, timeout=45)
+    if not html or len(html) < 100:
+        return None
+    plain = _html_to_plaintext_for_agent(html)
+    if len(plain.strip()) < 50:
+        return None
+    return (
+        "[Content via direct HTTP fetch — Firecrawl timed out or failed; "
+        "JS-only content may be missing.]\n\n"
+        + plain
+    )
+
+
+def _is_scrape_timeout_error(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if "timeout" in name or "timeout" in msg:
+        return True
+    return "timed out" in msg or "requesttimeout" in name
+
+
 async def scrape_page(url: str) -> str | None:
     """
     Scrape a single page via Firecrawl and return clean markdown content.
-    Returns None on failure.
+    On timeout, retries with a longer server-side timeout + short wait_for;
+    if still failing, falls back to direct HTTP + plaintext extraction.
     """
+    settings = get_settings()
     app = _get_async_firecrawl()
+    timeout_ms = max(1_000, min(int(settings.firecrawl_scrape_timeout_ms), 300_000))
+    wait_ms = max(0, int(settings.firecrawl_scrape_wait_for_ms))
+
+    async def _do_scrape(t_ms: int, w_ms: int) -> object:
+        kw: dict = {"url": url, "formats": ["markdown"], "timeout": t_ms}
+        if w_ms > 0:
+            kw["wait_for"] = w_ms
+        return await app.scrape(**kw)
+
     try:
-        result = await app.scrape(url=url, formats=["markdown"])
+        result = await _do_scrape(timeout_ms, wait_ms)
         content = _extract_markdown(result)
         if content and len(content.strip()) >= 50:
             return content
@@ -293,6 +338,24 @@ async def scrape_page(url: str) -> str | None:
         return content if content else None
     except Exception as e:
         print(f"[firecrawl] scrape failed for {url}: {type(e).__name__}: {e}")
+        if _is_scrape_timeout_error(e):
+            retry_t = min(300_000, max(timeout_ms * 2, 90_000))
+            retry_w = max(wait_ms, 2_000)
+            print(
+                f"[firecrawl] retrying scrape with timeout={retry_t}ms wait_for={retry_w}ms for {url}"
+            )
+            try:
+                result = await _do_scrape(retry_t, retry_w)
+                content = _extract_markdown(result)
+                if content and len(content.strip()) >= 50:
+                    return content
+            except Exception as e2:
+                print(f"[firecrawl] retry scrape failed for {url}: {type(e2).__name__}: {e2}")
+
+        fb = await _direct_http_scrape_fallback(url)
+        if fb:
+            print(f"[firecrawl] using direct HTTP fallback for {url} ({len(fb)} chars)")
+            return fb
         return None
 
 

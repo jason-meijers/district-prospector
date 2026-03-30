@@ -113,6 +113,10 @@ class Settings(BaseSettings):
     supabase_url: str | None = None
     supabase_service_key: str | None = None
     firecrawl_api_key: str | None = None
+    # Firecrawl /v2/scrape job timeout (ms). API default 30000; slow or JS-heavy pages often need 60–120s+.
+    firecrawl_scrape_timeout_ms: int = 120_000
+    # Extra delay before scrape (ms) for client-rendered content; 0 = off.
+    firecrawl_scrape_wait_for_ms: int = 0
 
     # How many districts to process in parallel per batch run
     batch_concurrency: int = 10
