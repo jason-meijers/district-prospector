@@ -136,39 +136,55 @@ def _extract_markdown(result: object) -> str | None:
     return None
 
 
+def _url_from_search_result_item(item: object) -> str | None:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        u = item.get("url") or item.get("link") or item.get("href")
+        return str(u) if u is not None else None
+    if hasattr(item, "url") and item.url is not None:  # type: ignore[union-attr]
+        return str(item.url)  # type: ignore[union-attr]
+    return None
+
+
 def _extract_search_urls(result: object) -> list[str]:
     """
     Extract URLs from a Firecrawl search() response.
 
-    v4 returns dict with result.get("web") as list[dict] each with a "url" key.
+    v4 may return a dict, a Pydantic model, or a typed object with a .web list
+    of items that have .url (often Pydantic AnyUrl, not str).
     """
+    # Pydantic v2 model → plain dict
+    if hasattr(result, "model_dump") and callable(result.model_dump):  # type: ignore[union-attr]
+        try:
+            result = result.model_dump()  # type: ignore[assignment]
+        except Exception:
+            pass
+
+    # Typed object: .web list (SearchResult items)
+    if hasattr(result, "web"):
+        web = getattr(result, "web", None)
+        if isinstance(web, list):
+            return [u for x in web if (u := _url_from_search_result_item(x)) is not None]
+
     if isinstance(result, dict):
         web = result.get("web") or []
-        if web:
-            return [item.get("url") for item in web if isinstance(item, dict) and item.get("url")]
+        if isinstance(web, list) and web:
+            return [u for x in web if (u := _url_from_search_result_item(x)) is not None]
+        data = result.get("data")
+        if isinstance(data, dict):
+            web = data.get("web") or []
+            if isinstance(web, list) and web:
+                return [u for x in web if (u := _url_from_search_result_item(x)) is not None]
         for key in ("data", "results", "links", "urls"):
             candidates = result.get(key)
             if isinstance(candidates, list):
-                urls = []
-                for item in candidates:
-                    if isinstance(item, str):
-                        urls.append(item)
-                    elif isinstance(item, dict):
-                        u = item.get("url") or item.get("link") or item.get("href")
-                        if isinstance(u, str):
-                            urls.append(u)
+                urls = [_url_from_search_result_item(item) for item in candidates]
+                urls = [u for u in urls if u]
                 if urls:
                     return urls
     if isinstance(result, list):
-        urls = []
-        for item in result:
-            if isinstance(item, str):
-                urls.append(item)
-            elif isinstance(item, dict):
-                u = item.get("url") or item.get("link")
-                if isinstance(u, str):
-                    urls.append(u)
-        return urls
+        return [u for item in result if (u := _url_from_search_result_item(item)) is not None]
     return []
 
 
@@ -392,17 +408,34 @@ async def discover_district_website(district_name: str) -> str | None:
     Returns the first result URL that looks like an official domain, or None.
     """
     app = _get_async_firecrawl()
-    query = f'"{district_name}" official school district website'
+    queries = (
+        f'"{district_name}" official school district website',
+        f"{district_name} school district official website",
+        f"{district_name} USD homepage",
+    )
 
     try:
-        result = await app.search(query=query, limit=5)
+        for query in queries:
+            result = await app.search(query=query, limit=8)
+            urls = _extract_search_urls(result)
+            if not urls:
+                print(
+                    f"[firecrawl] search returned 0 URLs for query={query!r} "
+                    f"(type={type(result).__name__}, repr={repr(result)[:400]})"
+                )
+                continue
 
-        for url in _extract_search_urls(result):
-            if url and _looks_like_official_website(url):
-                parsed = urlparse(url)
-                homepage = f"{parsed.scheme}://{parsed.netloc}"
-                print(f"[firecrawl] Discovered website for '{district_name}': {homepage}")
-                return homepage
+            for url in urls:
+                if url and _looks_like_official_website(url):
+                    parsed = urlparse(url)
+                    homepage = f"{parsed.scheme}://{parsed.netloc}"
+                    print(f"[firecrawl] Discovered website for '{district_name}': {homepage}")
+                    return homepage
+
+            print(
+                f"[firecrawl] search had {len(urls)} URLs but none passed official-domain filter "
+                f"for '{district_name}' (first: {urls[0] if urls else None})"
+            )
 
         print(f"[firecrawl] Could not find official website for '{district_name}'")
         return None
