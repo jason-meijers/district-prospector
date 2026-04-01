@@ -118,6 +118,14 @@ class Settings(BaseSettings):
     # Extra delay before scrape (ms) for client-rendered content; 0 = off.
     firecrawl_scrape_wait_for_ms: int = 0
 
+    # Optional: after scrape, use /v2/scrape/{id}/interact for JS-heavy / paginated directories
+    firecrawl_interact_enabled: bool = True
+    # Trigger interact only when markdown is shorter than this AND URL looks directory-like
+    firecrawl_interact_min_markdown_chars: int = 400
+    firecrawl_interact_max_pages: int = 15
+    firecrawl_interact_max_seconds: int = 120
+    firecrawl_interact_concurrency: int = 2
+
     # How many districts to process in parallel per batch run
     batch_concurrency: int = 10
     # Max distinct target URLs to scrape per district (not counting pagination within a directory)

@@ -2,7 +2,12 @@ from __future__ import annotations
 import asyncio
 import traceback
 from app.config import get_settings
-from app.firecrawl_scraper import scrape_district, discover_district_website
+from app.firecrawl_scraper import (
+    discover_district_website,
+    format_firecrawl_usage_slack_line,
+    new_firecrawl_usage,
+    scrape_district,
+)
 from app.batch_agent import BatchExtractionAgent
 from app.database import (
     claim_next_district,
@@ -47,6 +52,7 @@ async def _process_one_district(
     pipedrive_org_id = district.get("pipedrive_org_id")
 
     settings = get_settings()
+    fc_usage = new_firecrawl_usage()
 
     async with semaphore:
         print(f"[batch] Starting: {org_name} ({website_url})")
@@ -72,7 +78,7 @@ async def _process_one_district(
             # Step 1a: Discover website if missing
             if not website_url:
                 print(f"[batch] No website for {org_name} — searching via Firecrawl...")
-                website_url = await discover_district_website(org_name)
+                website_url = await discover_district_website(org_name, usage=fc_usage)
 
                 if website_url:
                     await _persist_discovered_website(website_url)
@@ -86,19 +92,20 @@ async def _process_one_district(
                         "reason": msg,
                         "contacts": 0,
                         "pipedrive_org_id": pipedrive_org_id,
+                        "firecrawl_usage": fc_usage,
                     }
 
             # Step 1b: Scrape via Firecrawl
-            pages = await scrape_district(website_url)
+            pages, fc_usage = await scrape_district(website_url, usage=fc_usage)
             if not pages:
                 print(f"[batch] {org_name}: No content from listed website ({website_url}) — attempting rediscovery...")
-                fallback_url = await discover_district_website(org_name)
+                fallback_url = await discover_district_website(org_name, usage=fc_usage)
 
                 if fallback_url and fallback_url.rstrip("/") != website_url.rstrip("/"):
                     print(f"[batch] {org_name}: trying fallback website {fallback_url}")
                     await _persist_discovered_website(fallback_url)
                     website_url = fallback_url
-                    pages = await scrape_district(website_url)
+                    pages, fc_usage = await scrape_district(website_url, usage=fc_usage)
 
                 if not pages:
                     msg = f"No content retrieved from {website_url}"
@@ -110,6 +117,7 @@ async def _process_one_district(
                         "reason": msg,
                         "contacts": 0,
                         "pipedrive_org_id": pipedrive_org_id,
+                        "firecrawl_usage": fc_usage,
                     }
 
             used_urls = [p.get("url") for p in pages if p.get("url")]
@@ -138,6 +146,7 @@ async def _process_one_district(
                 "used_urls": used_urls,
                 "contacts_detail": contacts,
                 "pipedrive_org_id": pipedrive_org_id,
+                "firecrawl_usage": fc_usage,
             }
 
         except Exception as e:
@@ -154,6 +163,7 @@ async def _process_one_district(
                 "used_urls": [],
                 "contacts_detail": [],
                 "pipedrive_org_id": pipedrive_org_id,
+                "firecrawl_usage": fc_usage,
             }
 
 
@@ -207,6 +217,9 @@ async def _post_batch_result_to_slack(result: dict) -> None:
         if cache_create or cache_read:
             tok_line += f" (cache create {cache_create:,} / read {cache_read:,})"
 
+        fc_line = format_firecrawl_usage_slack_line(
+            result.get("firecrawl_usage") if isinstance(result.get("firecrawl_usage"), dict) else None
+        )
         parent = (
             f"✅ *Batch district complete*\n"
             f"District: {district_display}\n"
@@ -214,6 +227,8 @@ async def _post_batch_result_to_slack(result: dict) -> None:
             f"Contacts found: {len(contacts)}\n"
             f"{tok_line}"
         )
+        if fc_line:
+            parent += f"\n{fc_line}"
         thread_ts = await slack.post_message(parent)
         if not thread_ts:
             return

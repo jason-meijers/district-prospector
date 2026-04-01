@@ -1,8 +1,242 @@
 from __future__ import annotations
+import asyncio
+import json
+import time
 import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from app.config import get_settings
+
+# Playwright (node) — paginate staff directories in one interact call; __MAX_PAGES__ substituted at runtime.
+_INTERACT_NODE_TEMPLATE = r"""
+const maxPages = __MAX_PAGES__;
+const chunks = [];
+for (let p = 0; p < maxPages; p++) {
+  await page.waitForTimeout(300);
+  const txt = await page.evaluate(() => (document.body && document.body.innerText) ? document.body.innerText : '');
+  chunks.push('--- Page ' + (p + 1) + ' ---\n' + String(txt).slice(0, 60000));
+  if (p >= maxPages - 1) break;
+  const urlBefore = page.url();
+  let clicked = false;
+  const selectors = [
+    'a[rel="next"]',
+    'a[aria-label*="Next" i]',
+    'button[aria-label*="Next" i]',
+    'a.pagination-next',
+    '.pagination a.next',
+    'a[class*="next" i]',
+  ];
+  for (const sel of selectors) {
+    try {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible({ timeout: 600 })) {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+          loc.click(),
+        ]);
+        clicked = true;
+        break;
+      }
+    } catch (e) {}
+  }
+  if (!clicked) break;
+  if (page.url() === urlBefore) break;
+}
+JSON.stringify({ markdown: chunks.join('\n\n') });
+"""
+
+_interact_semaphore: asyncio.Semaphore | None = None
+
+
+def new_firecrawl_usage() -> dict:
+    return {
+        "scrape_calls": 0,
+        "map_calls": 0,
+        "search_calls": 0,
+        "scrape_credits_sum": 0,
+        "interact_calls": 0,
+        "interact_seconds": 0.0,
+        "interact_mode": None,
+        "interact_stop_credits": 0,
+    }
+
+
+def estimate_firecrawl_credits(usage: dict) -> dict:
+    """
+    Rough credit estimate (Firecrawl bills in credits; interact is time-based for code vs prompt).
+    When the API returns ``interact_stop_credits``, we use max(time-based, stop) for interact.
+    """
+    scrape_est = float(usage.get("scrape_calls") or 0)
+    secs = float(usage.get("interact_seconds") or 0)
+    mode = usage.get("interact_mode") or "code"
+    rate = 7.0 if mode == "prompt" else 2.0
+    interact_from_time = (secs / 60.0) * rate
+    stop = float(usage.get("interact_stop_credits") or 0)
+    interact_est = max(interact_from_time, stop) if stop > 0 else interact_from_time
+    map_est = float(usage.get("map_calls") or 0)
+    search_est = float(usage.get("search_calls") or 0)
+    total = scrape_est + interact_est + map_est + search_est
+    return {
+        "scrape_estimate": scrape_est,
+        "interact_estimate": round(interact_est, 2),
+        "stop_credits": stop,
+        "map_estimate": map_est,
+        "search_estimate": search_est,
+        "total_estimate": round(total, 2),
+    }
+
+
+def format_firecrawl_usage_slack_line(usage: dict | None) -> str:
+    if not usage:
+        return ""
+    if not (
+        usage.get("scrape_calls")
+        or usage.get("interact_calls")
+        or usage.get("map_calls")
+        or usage.get("search_calls")
+    ):
+        return ""
+    est = estimate_firecrawl_credits(usage)
+    parts: list[str] = []
+    if usage.get("scrape_calls"):
+        parts.append(f"{usage['scrape_calls']} scrape(s)")
+    if usage.get("map_calls"):
+        parts.append(f"{usage['map_calls']} map(s)")
+    if usage.get("search_calls"):
+        parts.append(f"{usage['search_calls']} search(es)")
+    if usage.get("interact_calls"):
+        mode = usage.get("interact_mode") or "code"
+        secs = float(usage.get("interact_seconds") or 0)
+        parts.append(f"{usage['interact_calls']} interact, {secs:.1f}s ({mode})")
+    summary = "; ".join(parts)
+    return (
+        f"Firecrawl (est.): {summary} — ≈ {est['total_estimate']} credits "
+        f"(~1/scrape & map/search; interact ~2/min code, ~7/min prompt)"
+    )
+
+
+def _get_interact_semaphore() -> asyncio.Semaphore:
+    global _interact_semaphore
+    if _interact_semaphore is None:
+        n = max(1, get_settings().firecrawl_interact_concurrency)
+        _interact_semaphore = asyncio.Semaphore(n)
+    return _interact_semaphore
+
+
+def _add_scrape_credits_from_document(usage: dict, doc: object) -> None:
+    try:
+        if hasattr(doc, "metadata_typed"):
+            cu = doc.metadata_typed.credits_used
+            if cu is not None:
+                usage["scrape_credits_sum"] = int(usage.get("scrape_credits_sum") or 0) + int(cu)
+    except (TypeError, ValueError):
+        pass
+
+
+def _extract_scrape_id(result: object) -> str | None:
+    if result is None:
+        return None
+    md = getattr(result, "metadata", None)
+    if md is None:
+        return None
+    if hasattr(md, "scrape_id") and md.scrape_id:
+        return str(md.scrape_id)
+    if isinstance(md, dict):
+        sid = md.get("scrape_id") or md.get("scrapeId")
+        return str(sid) if sid else None
+    return None
+
+
+def _directory_like_url(url: str) -> bool:
+    """True if path suggests staff/leadership directory (same signals as map scoring)."""
+    return _score_url(url) >= 1
+
+
+def _should_run_interact(url: str, markdown: str | None, settings) -> bool:
+    if not settings.firecrawl_interact_enabled:
+        return False
+    if not _directory_like_url(url):
+        return False
+    n = len((markdown or "").strip())
+    return n < int(settings.firecrawl_interact_min_markdown_chars)
+
+
+def _text_from_interact_response(resp: object) -> str | None:
+    if resp is None:
+        return None
+    raw = getattr(resp, "result", None) or getattr(resp, "stdout", None) or getattr(resp, "output", None)
+    if isinstance(raw, dict):
+        return raw.get("markdown") or raw.get("text")
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data.get("markdown") or data.get("text")
+        except json.JSONDecodeError:
+            pass
+    if isinstance(raw, str) and len(raw.strip()) > 50:
+        return raw.strip()
+    return None
+
+
+async def _run_interact_directory(
+    app: object,
+    scrape_id: str,
+    settings,
+    page_url: str,
+    usage: dict | None,
+) -> str | None:
+    """
+    One code-based interact session: capture text per page and follow Next controls.
+    """
+    max_pages = max(1, min(int(settings.firecrawl_interact_max_pages), 50))
+    code = _INTERACT_NODE_TEMPLATE.replace("__MAX_PAGES__", str(max_pages))
+    timeout_sec = max(10, min(int(settings.firecrawl_interact_max_seconds), 300))
+
+    async with _get_interact_semaphore():
+        interact_fn = getattr(app, "interact", None)
+        if not interact_fn:
+            return None
+        t0 = time.monotonic()
+        text_out: str | None = None
+        try:
+            resp = await interact_fn(
+                scrape_id,
+                code=code,
+                language="node",
+                timeout=timeout_sec,
+                origin="district-prospector",
+            )
+            if usage is not None:
+                usage["interact_calls"] = int(usage.get("interact_calls") or 0) + 1
+                usage["interact_mode"] = "code"
+            raw = _text_from_interact_response(resp)
+            if raw and len(raw.strip()) > 80:
+                text_out = (
+                    "## Staff directory (Firecrawl interact)\n"
+                    f"Source: {page_url}\n\n"
+                    + raw
+                )
+            else:
+                print(f"[firecrawl] interact returned thin content for {page_url}")
+        except Exception as e:
+            print(f"[firecrawl] interact failed for {page_url}: {type(e).__name__}: {e}")
+        finally:
+            elapsed = time.monotonic() - t0
+            if usage is not None:
+                usage["interact_seconds"] = float(usage.get("interact_seconds") or 0) + elapsed
+            try:
+                stop_fn = getattr(app, "stop_interaction", None)
+                if stop_fn and scrape_id:
+                    stop = await stop_fn(scrape_id)
+                    cb = getattr(stop, "credits_billed", None)
+                    if usage is not None and cb is not None:
+                        usage["interact_stop_credits"] = int(
+                            usage.get("interact_stop_credits") or 0
+                        ) + int(cb)
+            except Exception as se:
+                print(f"[firecrawl] stop_interaction failed for {page_url}: {se}")
+        return text_out
 
 # Staff/leadership-related search terms passed to Firecrawl's map to bias
 # URL discovery toward pages that are likely to contain contact information
@@ -214,7 +448,11 @@ def _extract_search_urls(result: object) -> list[str]:
     return []
 
 
-async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]:
+async def discover_urls(
+    base_url: str,
+    max_urls: int | None = None,
+    usage: dict | None = None,
+) -> list[str]:
     """
     Use Firecrawl's map endpoint to discover relevant pages on a district website.
 
@@ -229,6 +467,8 @@ async def discover_urls(base_url: str, max_urls: int | None = None) -> list[str]
 
     try:
         result = await app.map(url=base_url, limit=fetch_limit)
+        if usage is not None:
+            usage["map_calls"] = int(usage.get("map_calls") or 0) + 1
 
         urls = _extract_urls_from_map(result)
         raw_repr = repr(result)[:300]
@@ -311,11 +551,13 @@ def _is_scrape_timeout_error(exc: Exception) -> bool:
     return "timed out" in msg or "requesttimeout" in name
 
 
-async def scrape_page(url: str) -> str | None:
+async def scrape_page(url: str, usage: dict | None = None) -> str | None:
     """
     Scrape a single page via Firecrawl and return clean markdown content.
     On timeout, retries with a longer server-side timeout + short wait_for;
     if still failing, falls back to direct HTTP + plaintext extraction.
+
+    When ``usage`` is provided, increments scrape/interact counters for Slack estimates.
     """
     settings = get_settings()
     app = _get_async_firecrawl()
@@ -328,9 +570,23 @@ async def scrape_page(url: str) -> str | None:
             kw["wait_for"] = w_ms
         return await app.scrape(**kw)
 
+    async def _merge_interact(content: str | None, result: object) -> str | None:
+        scrape_id = _extract_scrape_id(result)
+        if not scrape_id or not _should_run_interact(url, content, settings):
+            return content
+        print(f"[firecrawl] running interact for thin directory page {url}")
+        block = await _run_interact_directory(app, scrape_id, settings, url, usage)
+        if not block:
+            return content
+        return ((content or "").strip() + "\n\n" + block).strip() if content else block
+
     try:
         result = await _do_scrape(timeout_ms, wait_ms)
+        if usage is not None:
+            usage["scrape_calls"] = int(usage.get("scrape_calls") or 0) + 1
+            _add_scrape_credits_from_document(usage, result)
         content = _extract_markdown(result)
+        content = await _merge_interact(content, result)
         if content and len(content.strip()) >= 50:
             return content
 
@@ -346,7 +602,11 @@ async def scrape_page(url: str) -> str | None:
             )
             try:
                 result = await _do_scrape(retry_t, retry_w)
+                if usage is not None:
+                    usage["scrape_calls"] = int(usage.get("scrape_calls") or 0) + 1
+                    _add_scrape_credits_from_document(usage, result)
                 content = _extract_markdown(result)
+                content = await _merge_interact(content, result)
                 if content and len(content.strip()) >= 50:
                     return content
             except Exception as e2:
@@ -359,13 +619,13 @@ async def scrape_page(url: str) -> str | None:
         return None
 
 
-async def scrape_pages(urls: list[str]) -> list[dict]:
+async def scrape_pages(urls: list[str], usage: dict | None = None) -> list[dict]:
     """
     Scrape multiple pages in parallel.
     Returns list of {"url": str, "content": str} for pages that succeeded.
     """
     import asyncio
-    tasks = [scrape_page(url) for url in urls]
+    tasks = [scrape_page(url, usage) for url in urls]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     pages = []
@@ -497,7 +757,10 @@ def _looks_like_official_website(url: str) -> bool:
         return False
 
 
-async def discover_district_website(district_name: str) -> str | None:
+async def discover_district_website(
+    district_name: str,
+    usage: dict | None = None,
+) -> str | None:
     """
     Use Firecrawl search to find the official website for a school district
     when no URL is stored in Pipedrive or the districts table.
@@ -514,6 +777,8 @@ async def discover_district_website(district_name: str) -> str | None:
     try:
         for query in queries:
             result = await app.search(query=query, limit=8)
+            if usage is not None:
+                usage["search_calls"] = int(usage.get("search_calls") or 0) + 1
             urls = _extract_search_urls(result)
             if not urls:
                 print(
@@ -601,7 +866,10 @@ async def _fetch_pages_direct(urls: list[str]) -> list[dict]:
     return pages
 
 
-async def scrape_district(base_url: str) -> list[dict]:
+async def scrape_district(
+    base_url: str,
+    usage: dict | None = None,
+) -> tuple[list[dict], dict]:
     """
     Full pipeline for a single district:
     1. Use Firecrawl map to discover relevant subpage URLs.
@@ -610,14 +878,20 @@ async def scrape_district(base_url: str) -> list[dict]:
        scrape those pages (Firecrawl first, direct HTTP if that also fails).
     4. Supplement with SchoolInsites direct API if detected.
 
-    Returns a list of {"url": str, "content": str} dicts ready to pass
-    to the batch extraction agent.
+    Returns ``(pages, firecrawl_usage)`` where pages are ``{"url", "content"}``
+    dicts for the batch extraction agent. ``firecrawl_usage`` aggregates API
+    calls for Slack cost estimates (optional interact on thin directory pages).
     """
     settings = get_settings()
+    fc_usage = usage if usage is not None else new_firecrawl_usage()
     print(f"[firecrawl] Starting scrape for {base_url}")
 
     # Step 1: discover target URLs via Firecrawl map
-    subpage_urls = await discover_urls(base_url, max_urls=settings.batch_max_target_pages)
+    subpage_urls = await discover_urls(
+        base_url,
+        max_urls=settings.batch_max_target_pages,
+        usage=fc_usage,
+    )
 
     # Always include homepage; deduplicate. Keep only the configured primary host
     # (www vs non-www), never sibling subdomains from map (not cache — map/sitemap).
@@ -627,7 +901,7 @@ async def scrape_district(base_url: str) -> list[dict]:
     ]
 
     # Step 2: scrape all pages in parallel via Firecrawl
-    pages = await scrape_pages(all_urls)
+    pages = await scrape_pages(all_urls, fc_usage)
     print(f"[firecrawl] Scraped {len(pages)} pages for {base_url}")
 
     # Step 3: if Firecrawl map found no subpages (or total pages still < 2),
@@ -644,7 +918,7 @@ async def scrape_district(base_url: str) -> list[dict]:
             print(f"[firecrawl] HTML fallback discovered {len(discovered)} candidate subpage URLs for {base_url}")
 
             if discovered:
-                fc_subpages = await scrape_pages(discovered)
+                fc_subpages = await scrape_pages(discovered, fc_usage)
                 if fc_subpages:
                     print(f"[firecrawl] Firecrawl scraped {len(fc_subpages)} discovered subpages for {base_url}")
                     pages.extend(fc_subpages)
@@ -663,4 +937,4 @@ async def scrape_district(base_url: str) -> list[dict]:
     if si_text:
         pages.insert(0, {"url": f"{base_url} [SchoolInsites API]", "content": si_text})
 
-    return pages
+    return pages, fc_usage

@@ -588,7 +588,7 @@ async def batch_test_url(payload: BatchTestUrlRequest):
     try:
         from app.firecrawl_scraper import scrape_district
 
-        pages = await scrape_district(payload.website_url)
+        pages, firecrawl_usage = await scrape_district(payload.website_url)
         page_urls = [p.get("url") for p in pages if p.get("url")]
         page_lengths = [
             {"url": p.get("url"), "chars": len((p.get("content") or ""))}
@@ -605,6 +605,7 @@ async def batch_test_url(payload: BatchTestUrlRequest):
                 "contacts_found": 0,
                 "contacts": [],
                 "token_usage": {},
+                "firecrawl_usage": firecrawl_usage,
             }
 
         if not settings.anthropic_api_key:
@@ -628,6 +629,7 @@ async def batch_test_url(payload: BatchTestUrlRequest):
             "contacts": contacts,
             "email_pattern": email_pattern,
             "token_usage": usage,
+            "firecrawl_usage": firecrawl_usage,
         }
     except HTTPException:
         raise
