@@ -2,7 +2,11 @@
 
 import unittest
 
-from app.slack import sanitize_email_for_pipedrive, sanitize_phone_for_pipedrive
+from app.slack import (
+    pipedrive_payload_blocks,
+    sanitize_email_for_pipedrive,
+    sanitize_phone_for_pipedrive,
+)
 
 
 class TestSanitizePhone(unittest.TestCase):
@@ -25,6 +29,18 @@ class TestSanitizeEmail(unittest.TestCase):
             sanitize_email_for_pipedrive("mailto:jane@school.org"),
             "jane@school.org",
         )
+
+
+class TestPayloadBlocks(unittest.TestCase):
+    def test_fenced_sections_use_verbatim_true(self):
+        blocks = pipedrive_payload_blocks(
+            header_mrkdwn="*Header*",
+            person_body_json='{"x": 1}',
+            note_content="note",
+        )
+        self.assertTrue(blocks[1]["text"]["verbatim"])
+        self.assertFalse(blocks[0]["text"]["verbatim"])
+        self.assertTrue(blocks[3]["text"]["verbatim"])
 
 
 if __name__ == "__main__":
