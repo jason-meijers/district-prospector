@@ -233,20 +233,20 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
 
         # Post updated contacts (person payload + note in same message)
         for contact in updated:
-            msg, bl = slack.format_updated_contact(contact, date_str)
-            await slack.post_thread(thread_ts, msg, blocks=bl)
+            msg = slack.format_updated_contact(contact, date_str)
+            await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
         # Post new contacts
         for contact in new:
-            msg, bl = slack.format_new_contact(contact, org_id, date_str)
-            await slack.post_thread(thread_ts, msg, blocks=bl)
+            msg = slack.format_new_contact(contact, org_id, date_str)
+            await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
         # Post missing contacts (person payload + note in same message)
         for contact in missing:
-            msg, bl = slack.format_missing_contact(contact, website_url, date_str)
-            await slack.post_thread(thread_ts, msg, blocks=bl)
+            msg = slack.format_missing_contact(contact, website_url, date_str)
+            await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
         # Post deal alerts for missing contacts who are still the main contact on open deals

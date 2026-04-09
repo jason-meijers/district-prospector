@@ -77,49 +77,9 @@ def format_slack_source_url_line(source_url: str | None) -> str:
     return f"📄 Source: {slack_plaintext_no_autolink(u)}"
 
 
-# Block Kit: mrkdwn "verbatim: true" disables automatic URL/email/phone linkification in that block.
-_SLACK_MRKDWN_MAX = 2900
-
-
 def _escape_mrkdwn_code_fence(s: str) -> str:
     """So JSON/note text cannot break out of ``` fences."""
     return s.replace("```", "`\u200b``")
-
-
-def _section_mrkdwn(text: str, *, verbatim: bool) -> dict:
-    if len(text) > _SLACK_MRKDWN_MAX:
-        text = text[: _SLACK_MRKDWN_MAX - 1] + "…"
-    return {
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": text, "verbatim": verbatim},
-    }
-
-
-def pipedrive_payload_blocks(
-    *,
-    header_mrkdwn: str,
-    person_body_json: str,
-    note_content: str,
-) -> list[dict]:
-    """
-    Block Kit sections: header (links OK); fenced JSON + note in verbatim blocks
-    so Slack clients do not turn emails/phones/URLs into hyperlinks.
-    """
-    pjson = _escape_mrkdwn_code_fence(person_body_json)
-    ntxt = _escape_mrkdwn_code_fence(note_content)
-    payload_fence = f"```\n{pjson}\n```"
-    note_fence = f"```\n{ntxt}\n```"
-    blocks: list[dict] = [
-        _section_mrkdwn(header_mrkdwn, verbatim=False),
-        _section_mrkdwn(payload_fence, verbatim=True),
-        _section_mrkdwn(
-            "--Payload End--\n\n*Action: Add Note*\n--Note Start--",
-            verbatim=False,
-        ),
-        _section_mrkdwn(note_fence, verbatim=True),
-        _section_mrkdwn("--Note End--", verbatim=False),
-    ]
-    return blocks
 
 
 class SlackClient:
@@ -234,9 +194,7 @@ class SlackClient:
             f"• Total: {total:,}"
         )
 
-    def format_new_contact(
-        self, contact: dict, org_id: int, date_str: str
-    ) -> tuple[str, list[dict]]:
+    def format_new_contact(self, contact: dict, org_id: int, date_str: str) -> str:
         role_field_key = PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY
         email_val = sanitize_email_for_pipedrive(contact.get("email"))
         phone_val = sanitize_phone_for_pipedrive(contact.get("phone"))
@@ -293,8 +251,12 @@ class SlackClient:
         source_line = format_slack_source_url_line(contact.get("source_url"))
         person_body_json = json.dumps(body, indent=2)
         role_label = contact.get("role_category_label") or contact.get("role_category") or "N/A"
+        pjson = _escape_mrkdwn_code_fence(person_body_json)
+        ntxt = _escape_mrkdwn_code_fence(note_content)
 
-        header = (
+        # Single `text` message (no Block Kit): Zapier and integrations need the full API body
+        # in one field; Block Kit sections truncate and show "Show more".
+        return (
             f"🆕 *CREATE: {contact['name']}*\n"
             f"📋 Title: {contact['job_title']}\n"
             f"🏷️ Role Category: {role_label}\n"
@@ -303,19 +265,16 @@ class SlackClient:
             f"{source_line}\n"
             f"📝 {contact.get('notes', '')}\n\n"
             f"*Action: Create Person*\n"
-            f"--Payload Start--"
+            f"--Payload Start--\n"
+            f"```\n{pjson}\n```\n"
+            f"--Payload End--\n\n"
+            f"*Action: Add Note*\n"
+            f"--Note Start--\n"
+            f"```\n{ntxt}\n```\n"
+            f"--Note End--"
         )
-        blocks = pipedrive_payload_blocks(
-            header_mrkdwn=header,
-            person_body_json=person_body_json,
-            note_content=note_content,
-        )
-        fallback = (
-            f"🆕 CREATE: {contact['name']} — open thread for Pipedrive payloads (JSON in verbatim blocks)"
-        )
-        return fallback, blocks
 
-    def format_updated_contact(self, contact: dict, date_str: str) -> tuple[str, list[dict]]:
+    def format_updated_contact(self, contact: dict, date_str: str) -> str:
         changes_display = "\n".join(
             f"  • {c}" for c in contact.get("changes", [])
         )
@@ -358,22 +317,23 @@ class SlackClient:
         source_line = format_slack_source_url_line(contact.get("source_url"))
         person_body_json = json.dumps(body, indent=2)
         person_id = contact['pipedrive_person_id']
-        header = (
+        pjson = _escape_mrkdwn_code_fence(person_body_json)
+        ntxt = _escape_mrkdwn_code_fence(note_content)
+        return (
             f"✏️ *UPDATE: {contact['name']}* (ID: {person_id})\n"
             f"📋 Changes:\n{changes_display}\n"
             f"{source_line}\n"
             f"📝 {contact.get('notes', '')}\n\n"
             f"*Action: Update Person*\n"
             f"Person ID: {person_id}\n"
-            f"--Payload Start--"
+            f"--Payload Start--\n"
+            f"```\n{pjson}\n```\n"
+            f"--Payload End--\n\n"
+            f"*Action: Add Note*\n"
+            f"--Note Start--\n"
+            f"```\n{ntxt}\n```\n"
+            f"--Note End--"
         )
-        blocks = pipedrive_payload_blocks(
-            header_mrkdwn=header,
-            person_body_json=person_body_json,
-            note_content=note_content,
-        )
-        fallback = f"✏️ UPDATE: {contact['name']} — open thread for Pipedrive payloads"
-        return fallback, blocks
 
     def format_note_payload(self, person_id: int, content: str, action_label: str = "add_note") -> str:
         """Format a standalone note for the notes endpoint (separate thread message)."""
@@ -412,9 +372,7 @@ class SlackClient:
             f"_Recommend reassigning these deals to an active contact._"
         )
 
-    def format_missing_contact(
-        self, contact: dict, website_url: str, date_str: str
-    ) -> tuple[str, list[dict]]:
+    def format_missing_contact(self, contact: dict, website_url: str, date_str: str) -> str:
         previous_title = (contact.get("previous_title") or "Unknown").strip()
 
         note_content = (
@@ -430,18 +388,19 @@ class SlackClient:
         }
         person_body_json = json.dumps(person_body, indent=2)
         person_id = contact['pipedrive_person_id']
-        header = (
+        pjson = _escape_mrkdwn_code_fence(person_body_json)
+        ntxt = _escape_mrkdwn_code_fence(note_content)
+        return (
             f"⚠️ *NOT FOUND: {contact['name']}* (ID: {person_id})\n"
             f"📋 Last known title: {previous_title}\n"
             f"📝 Not found on current district website. Recommend updating Role Category → Former (see payload below).\n\n"
             f"*Action: Update Person*\n"
             f"Person ID: {person_id}\n"
-            f"--Payload Start--"
+            f"--Payload Start--\n"
+            f"```\n{pjson}\n```\n"
+            f"--Payload End--\n\n"
+            f"*Action: Add Note*\n"
+            f"--Note Start--\n"
+            f"```\n{ntxt}\n```\n"
+            f"--Note End--"
         )
-        blocks = pipedrive_payload_blocks(
-            header_mrkdwn=header,
-            person_body_json=person_body_json,
-            note_content=note_content,
-        )
-        fallback = f"⚠️ NOT FOUND: {contact['name']} — open thread for Pipedrive payloads"
-        return fallback, blocks
