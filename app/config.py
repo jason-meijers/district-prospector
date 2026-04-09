@@ -105,6 +105,7 @@ class Settings(BaseSettings):
     max_subpages: int = 7
     max_directory_pages: int = 2  # extra pagination pages to fetch per staff-directory-like URL
     claude_model: str = "claude-sonnet-4-20250514"
+    pipedrive_use_batch_pipeline: bool = False
 
     # Optional: require this secret on /webhook/pipedrive (header X-Webhook-Secret or query ?secret=)
     webhook_secret: str | None = None
@@ -126,6 +127,13 @@ class Settings(BaseSettings):
     firecrawl_interact_max_seconds: int = 120
     firecrawl_interact_concurrency: int = 2
 
+    # Directory-first pipeline: map candidate count, cheap LLM URL triage, post-triage scrape caps
+    batch_map_candidate_limit: int = 50
+    batch_triage_max_candidates: int = 45
+    batch_url_triage_model: str = "claude-3-5-haiku-20241022"
+    batch_max_scrape_urls: int = 8
+    batch_enrichment_url_cap: int = 5
+
     # How many districts to process in parallel per batch run
     batch_concurrency: int = 10
     # Max distinct target URLs to scrape per district (not counting pagination within a directory)
@@ -133,6 +141,13 @@ class Settings(BaseSettings):
     # Max characters to pass to Claude per page (controls token cost).
     # 12k avoids losing staff blocks on sites with heavy repeated nav before main content.
     batch_chars_per_page: int = 12000
+
+    # Pipedrive-triggered max-lead profile (used when pipedrive_use_batch_pipeline=true)
+    pipedrive_map_candidate_limit: int = 80
+    pipedrive_triage_max_candidates: int = 60
+    pipedrive_max_scrape_urls: int = 12
+    pipedrive_enrichment_url_cap: int = 8
+    pipedrive_chars_per_page: int = 16000
 
     # Google Sheets ID for EOD review export (optional)
     google_sheet_id: str | None = None

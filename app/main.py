@@ -21,6 +21,11 @@ from app.config import (
 from app.pipedrive import PipedriveClient
 from app.slack import SlackClient
 from app.agent import ExtractionAgent
+from app.firecrawl_scraper import (
+    discover_district_website,
+    format_firecrawl_usage_slack_line,
+)
+from app.pipeline_research import run_firecrawl_research
 
 
 # ─────────────────────────────────────────────────────────────
@@ -71,7 +76,8 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
     settings = get_settings()
     pipedrive = PipedriveClient()
     slack = SlackClient()
-    agent = ExtractionAgent()
+    use_batch_pipeline = settings.pipedrive_use_batch_pipeline
+    agent = ExtractionAgent() if not use_batch_pipeline else None
 
     try:
         # ── Step 1: Get context from Pipedrive ──────────────────
@@ -91,7 +97,10 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
 
         if not website_url:
             # No website on file — try to discover it
-            website_url = await agent.discover_website(org_name)
+            if use_batch_pipeline:
+                website_url = await discover_district_website(org_name)
+            elif agent:
+                website_url = await agent.discover_website(org_name)
 
             if website_url:
                 website_was_discovered = True
@@ -119,8 +128,18 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
             f"and {len(all_person_names)} total active persons in Pipedrive"
         )
 
-        # ── Step 2: Run the extraction agent ────────────────────
-        result = await agent.run(org_name, website_url, existing_contacts, all_person_names)
+        # ── Step 2: Run extraction ───────────────────────────────
+        if use_batch_pipeline:
+            result = await run_firecrawl_research(
+                org_name=org_name,
+                website_url=website_url,
+                existing_contacts=existing_contacts,
+                all_person_names=all_person_names,
+            )
+        elif agent:
+            result = await agent.run(org_name, website_url, existing_contacts, all_person_names)
+        else:
+            result = {"error": "No extraction pipeline available"}
 
         if "error" in result:
             await slack.post_message(
@@ -213,6 +232,34 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
                 thread_ts,
                 f"🔬 *Research Notes*\n{notes}"
             )
+
+        # Post Firecrawl usage details when available
+        firecrawl_usage_line = format_firecrawl_usage_slack_line(
+            result.get("firecrawl_usage")
+            if isinstance(result.get("firecrawl_usage"), dict)
+            else None
+        )
+        if firecrawl_usage_line:
+            await slack.post_thread(thread_ts, f"🔥 *Firecrawl Usage*\n{firecrawl_usage_line}")
+
+        # Post URL triage metadata when available
+        url_triage = result.get("url_triage")
+        if isinstance(url_triage, dict) and (
+            url_triage.get("staff_directory_url")
+            or url_triage.get("enrichment_urls")
+            or "used_heuristic" in url_triage
+        ):
+            mode = "heuristic fallback" if url_triage.get("used_heuristic") else "triage"
+            directory_url = url_triage.get("staff_directory_url") or "N/A"
+            enrichment_count = len(url_triage.get("enrichment_urls") or [])
+            triage_line = (
+                f"🧭 *URL Triage*\n"
+                f"Mode: {mode}\n"
+                f"Directory: `{directory_url}`\n"
+                f"Enrichment URLs: {enrichment_count}\n"
+                f"Rationale: {url_triage.get('rationale') or 'N/A'}"
+            )
+            await slack.post_thread(thread_ts, triage_line)
 
         # Post email pattern info
         email_pattern = result.get("email_pattern", {})
@@ -443,6 +490,7 @@ class ApproveContactsRequest(BaseModel):
 class BatchTestUrlRequest(BaseModel):
     website_url: str
     org_name: str = "Manual test district"
+    state: str | None = None
     run_extract: bool = True
 
 
@@ -587,8 +635,15 @@ async def batch_test_url(payload: BatchTestUrlRequest):
 
     try:
         from app.firecrawl_scraper import scrape_district
+        from app.batch_agent import BatchExtractionAgent
 
-        pages, firecrawl_usage = await scrape_district(payload.website_url)
+        scrape_agent = BatchExtractionAgent() if settings.anthropic_api_key else None
+        pages, firecrawl_usage, url_triage = await scrape_district(
+            payload.website_url,
+            district_name=payload.org_name if scrape_agent else None,
+            district_state=payload.state,
+            batch_agent=scrape_agent,
+        )
         page_urls = [p.get("url") for p in pages if p.get("url")]
         page_lengths = [
             {"url": p.get("url"), "chars": len((p.get("content") or ""))}
@@ -606,14 +661,13 @@ async def batch_test_url(payload: BatchTestUrlRequest):
                 "contacts": [],
                 "token_usage": {},
                 "firecrawl_usage": firecrawl_usage,
+                "url_triage": url_triage,
             }
 
-        if not settings.anthropic_api_key:
+        if not scrape_agent:
             raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
 
-        from app.batch_agent import BatchExtractionAgent
-        agent = BatchExtractionAgent()
-        contacts, email_pattern, usage = agent.extract_contacts_raw(
+        contacts, email_pattern, usage = scrape_agent.extract_contacts_raw(
             pages=pages,
             org_name=payload.org_name,
             website_url=payload.website_url,
@@ -630,6 +684,7 @@ async def batch_test_url(payload: BatchTestUrlRequest):
             "email_pattern": email_pattern,
             "token_usage": usage,
             "firecrawl_usage": firecrawl_usage,
+            "url_triage": url_triage,
         }
     except HTTPException:
         raise
