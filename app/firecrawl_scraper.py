@@ -163,8 +163,10 @@ def _should_run_interact(
         return False
     n = len((markdown or "").strip())
     thin = n < int(settings.firecrawl_interact_min_markdown_chars)
+    # Triage-selected staff directory: always run interact so we paginate (e.g. superintendent
+    # on page 3). Page 1 alone is often "thick" markdown, which previously skipped interact.
     if interact_priority:
-        return thin
+        return True
     if not _directory_like_url(url):
         return False
     return thin
@@ -691,8 +693,8 @@ async def scrape_page(
     if still failing, falls back to direct HTTP + plaintext extraction.
 
     When ``usage`` is provided, increments scrape/interact counters for Slack estimates.
-    ``interact_priority``: triage-selected staff directory — allow interact when
-    markdown is thin even if path heuristics do not match.
+    ``interact_priority``: triage-selected staff directory — always run interact to
+    paginate; page-1-only scrapes often miss leadership rows on later pages.
     """
     settings = get_settings()
     app = _get_async_firecrawl()
