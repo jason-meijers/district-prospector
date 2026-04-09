@@ -93,10 +93,17 @@ async def _process_one_district(
                         "contacts": 0,
                         "pipedrive_org_id": pipedrive_org_id,
                         "firecrawl_usage": fc_usage,
+                        "url_triage": None,
                     }
 
-            # Step 1b: Scrape via Firecrawl
-            pages, fc_usage = await scrape_district(website_url, usage=fc_usage)
+            # Step 1b: Scrape via Firecrawl (map → URL triage when agent + name present)
+            pages, fc_usage, url_triage = await scrape_district(
+                website_url,
+                usage=fc_usage,
+                district_name=org_name,
+                district_state=district.get("state"),
+                batch_agent=agent,
+            )
             if not pages:
                 print(f"[batch] {org_name}: No content from listed website ({website_url}) — attempting rediscovery...")
                 fallback_url = await discover_district_website(org_name, usage=fc_usage)
@@ -105,7 +112,13 @@ async def _process_one_district(
                     print(f"[batch] {org_name}: trying fallback website {fallback_url}")
                     await _persist_discovered_website(fallback_url)
                     website_url = fallback_url
-                    pages, fc_usage = await scrape_district(website_url, usage=fc_usage)
+                    pages, fc_usage, url_triage = await scrape_district(
+                        website_url,
+                        usage=fc_usage,
+                        district_name=org_name,
+                        district_state=district.get("state"),
+                        batch_agent=agent,
+                    )
 
                 if not pages:
                     msg = f"No content retrieved from {website_url}"
@@ -118,6 +131,7 @@ async def _process_one_district(
                         "contacts": 0,
                         "pipedrive_org_id": pipedrive_org_id,
                         "firecrawl_usage": fc_usage,
+                        "url_triage": None,
                     }
 
             used_urls = [p.get("url") for p in pages if p.get("url")]
@@ -147,6 +161,7 @@ async def _process_one_district(
                 "contacts_detail": contacts,
                 "pipedrive_org_id": pipedrive_org_id,
                 "firecrawl_usage": fc_usage,
+                "url_triage": url_triage,
             }
 
         except Exception as e:
@@ -164,6 +179,7 @@ async def _process_one_district(
                 "contacts_detail": [],
                 "pipedrive_org_id": pipedrive_org_id,
                 "firecrawl_usage": fc_usage,
+                "url_triage": None,
             }
 
 
@@ -220,6 +236,18 @@ async def _post_batch_result_to_slack(result: dict) -> None:
         fc_line = format_firecrawl_usage_slack_line(
             result.get("firecrawl_usage") if isinstance(result.get("firecrawl_usage"), dict) else None
         )
+        ut = result.get("url_triage")
+        triage_line = ""
+        if isinstance(ut, dict):
+            mode = "heuristic fallback" if ut.get("used_heuristic") else "triage"
+            dir_u = ut.get("staff_directory_url") or "—"
+            n_en = len(ut.get("enrichment_urls") or [])
+            tin = int(ut.get("triage_in_tokens") or 0)
+            tout = int(ut.get("triage_out_tokens") or 0)
+            triage_line = (
+                f"\nURL triage ({mode}): directory `{dir_u}` · {n_en} enrichment URL(s)"
+                f" · triage model {tin:,} in / {tout:,} out tokens"
+            )
         parent = (
             f"✅ *Batch district complete*\n"
             f"District: {district_display}\n"
@@ -229,6 +257,8 @@ async def _post_batch_result_to_slack(result: dict) -> None:
         )
         if fc_line:
             parent += f"\n{fc_line}"
+        if triage_line:
+            parent += triage_line
         thread_ts = await slack.post_message(parent)
         if not thread_ts:
             return

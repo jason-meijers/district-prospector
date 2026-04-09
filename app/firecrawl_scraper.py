@@ -6,6 +6,7 @@ import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from app.config import get_settings
+from app.batch_agent import BatchExtractionAgent
 
 # Playwright (node) — paginate staff directories in one interact call; __MAX_PAGES__ substituted at runtime.
 _INTERACT_NODE_TEMPLATE = r"""
@@ -152,13 +153,21 @@ def _directory_like_url(url: str) -> bool:
     return _score_url(url) >= 1
 
 
-def _should_run_interact(url: str, markdown: str | None, settings) -> bool:
+def _should_run_interact(
+    url: str,
+    markdown: str | None,
+    settings,
+    interact_priority: bool = False,
+) -> bool:
     if not settings.firecrawl_interact_enabled:
         return False
+    n = len((markdown or "").strip())
+    thin = n < int(settings.firecrawl_interact_min_markdown_chars)
+    if interact_priority:
+        return thin
     if not _directory_like_url(url):
         return False
-    n = len((markdown or "").strip())
-    return n < int(settings.firecrawl_interact_min_markdown_chars)
+    return thin
 
 
 def _text_from_interact_response(resp: object) -> str | None:
@@ -257,6 +266,9 @@ _LOW_VALUE_SEGMENTS = {
     "elementary", "primary", "k-5", "middle-school", "middle_school",
     "preschool", "pre-k", "news", "pub", "sitemap", "gallery", "photos",
     "new-families", "resources",
+    "police", "security", "safety-security", "maintenance", "facilities",
+    "facilities-construction", "construction", "purchasing", "fine-arts",
+    "corporate-relations", "bond-", "legal-services", "staff-discounts",
 }
 
 # URL path extensions / filenames to exclude entirely
@@ -362,6 +374,123 @@ def _extract_urls_from_map(result: object) -> list[str]:
         return [u for item in result if (u := _url_from_item(item)) is not None]
 
     return []
+
+
+def _normalize_map_url_key(u: str) -> str:
+    try:
+        p = urlparse((u or "").strip())
+        if not p.netloc:
+            return (u or "").strip().rstrip("/")
+        return f"{p.scheme or 'https'}://{p.netloc.lower()}{p.path}".rstrip("/")
+    except Exception:
+        return (u or "").strip().rstrip("/")
+
+
+def _link_item_from_map_entry(item: object) -> dict | None:
+    url: str | None = None
+    title = ""
+    description = ""
+    if isinstance(item, str):
+        url = item
+    elif isinstance(item, dict):
+        url = item.get("url") or item.get("link") or item.get("href")
+        t = item.get("title")
+        d = item.get("description")
+        title = (str(t) if t else "")[:300]
+        description = (str(d) if d else "")[:400]
+    else:
+        if hasattr(item, "url") and getattr(item, "url", None) is not None:
+            url = str(item.url)
+        if hasattr(item, "title") and getattr(item, "title", None) is not None:
+            title = str(item.title)[:300]
+        if hasattr(item, "description") and getattr(item, "description", None) is not None:
+            description = str(item.description)[:400]
+    if not url:
+        return None
+    return {
+        "url": _normalize_map_url_key(str(url)),
+        "title": title,
+        "description": description,
+    }
+
+
+def _link_items_from_map(result: object) -> list[dict]:
+    rows: list[dict] = []
+    seen: set[str] = set()
+
+    def consume_links(links: list) -> None:
+        for item in links:
+            row = _link_item_from_map_entry(item)
+            if not row:
+                continue
+            key = row["url"]
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+
+    if hasattr(result, "links"):
+        links = getattr(result, "links", None)
+        if isinstance(links, list):
+            consume_links(links)
+            return rows
+
+    if isinstance(result, dict):
+        data = result.get("data")
+        if isinstance(data, dict):
+            links = data.get("links")
+            if isinstance(links, list):
+                consume_links(links)
+                return rows
+        for key in ("links", "urls", "results"):
+            candidates = result.get(key)
+            if isinstance(candidates, list):
+                consume_links(candidates)
+                return rows
+    if isinstance(result, list):
+        consume_links(result)
+    return rows
+
+
+async def discover_map_candidates(
+    base_url: str,
+    usage: dict | None = None,
+) -> list[dict]:
+    """
+    Firecrawl map with a larger limit; return link dicts with url, title, description
+    for URL triage. Pre-filter obvious junk and cap list size for LLM context.
+    """
+    settings = get_settings()
+    app = _get_async_firecrawl()
+    fetch_limit = max(10, min(int(settings.batch_map_candidate_limit), 200))
+    cap = max(10, min(int(settings.batch_triage_max_candidates), 80))
+
+    try:
+        result = await app.map(url=base_url, limit=fetch_limit)
+        if usage is not None:
+            usage["map_calls"] = int(usage.get("map_calls") or 0) + 1
+
+        items = _link_items_from_map(result)
+        filtered: list[dict] = []
+        for row in items:
+            u = row["url"]
+            if not _url_matches_configured_site(u, base_url):
+                continue
+            if any(u.lower().endswith(ext) for ext in _EXCLUDED_EXTENSIONS):
+                continue
+            if _score_url(u) < -3:
+                continue
+            filtered.append(row)
+
+        filtered.sort(key=lambda r: (-_score_url(r["url"]), len(urlparse(r["url"]).path)))
+        print(
+            f"[firecrawl] map candidates {len(filtered)} (from {len(items)} raw links) for {base_url}"
+        )
+        return filtered[:cap]
+
+    except Exception as e:
+        print(f"[firecrawl] map candidates failed for {base_url}: {type(e).__name__}: {e}")
+        return []
 
 
 def _extract_markdown(result: object) -> str | None:
@@ -551,13 +680,19 @@ def _is_scrape_timeout_error(exc: Exception) -> bool:
     return "timed out" in msg or "requesttimeout" in name
 
 
-async def scrape_page(url: str, usage: dict | None = None) -> str | None:
+async def scrape_page(
+    url: str,
+    usage: dict | None = None,
+    interact_priority: bool = False,
+) -> str | None:
     """
     Scrape a single page via Firecrawl and return clean markdown content.
     On timeout, retries with a longer server-side timeout + short wait_for;
     if still failing, falls back to direct HTTP + plaintext extraction.
 
     When ``usage`` is provided, increments scrape/interact counters for Slack estimates.
+    ``interact_priority``: triage-selected staff directory — allow interact when
+    markdown is thin even if path heuristics do not match.
     """
     settings = get_settings()
     app = _get_async_firecrawl()
@@ -572,9 +707,11 @@ async def scrape_page(url: str, usage: dict | None = None) -> str | None:
 
     async def _merge_interact(content: str | None, result: object) -> str | None:
         scrape_id = _extract_scrape_id(result)
-        if not scrape_id or not _should_run_interact(url, content, settings):
+        if not scrape_id or not _should_run_interact(
+            url, content, settings, interact_priority=interact_priority
+        ):
             return content
-        print(f"[firecrawl] running interact for thin directory page {url}")
+        print(f"[firecrawl] running interact for directory page {url}")
         block = await _run_interact_directory(app, scrape_id, settings, url, usage)
         if not block:
             return content
@@ -625,7 +762,7 @@ async def scrape_pages(urls: list[str], usage: dict | None = None) -> list[dict]
     Returns list of {"url": str, "content": str} for pages that succeeded.
     """
     import asyncio
-    tasks = [scrape_page(url, usage) for url in urls]
+    tasks = [scrape_page(url, usage, interact_priority=False) for url in urls]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     pages = []
@@ -640,6 +777,163 @@ async def scrape_pages(urls: list[str], usage: dict | None = None) -> list[dict]
             dropped_short += 1
     if dropped_short:
         print(f"[firecrawl] dropped {dropped_short} short pages (<31 chars)")
+    return pages
+
+
+async def scrape_pages_with_interact_flags(
+    url_flag_pairs: list[tuple[str, bool]],
+    usage: dict | None = None,
+) -> list[dict]:
+    """Parallel scrape with per-URL interact_priority (for directory-first path)."""
+    import asyncio
+    tasks = [
+        scrape_page(url, usage, interact_priority=flag)
+        for url, flag in url_flag_pairs
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    pages: list[dict] = []
+    for (url, _), content in zip(url_flag_pairs, results):
+        if isinstance(content, Exception):
+            print(f"[firecrawl] scrape error for {url}: {content}")
+            continue
+        if content and len(content) > 30:
+            pages.append({"url": url, "content": content})
+    return pages
+
+
+def _url_triage_plan_usable(plan: dict) -> bool:
+    if not plan:
+        return False
+    if (plan.get("staff_directory_url") or "").strip():
+        return True
+    enrich = plan.get("enrichment_urls")
+    if isinstance(enrich, list) and len(enrich) > 0:
+        return True
+    return bool(plan.get("include_homepage", True))
+
+
+async def _scrape_district_triage_path(
+    base_url: str,
+    fc_usage: dict,
+    plan: dict,
+) -> list[dict]:
+    """SchoolInsites API, then staff directory (interact-friendly), then enrichment + homepage."""
+    settings = get_settings()
+    si_text = await _fetch_schoolinsites_directory(base_url)
+
+    dir_url = (plan.get("staff_directory_url") or "").strip()
+    if dir_url and not _url_matches_configured_site(dir_url, base_url):
+        print(f"[firecrawl] triage directory URL off-domain, discarding: {dir_url}")
+        dir_url = ""
+
+    enrich_raw = plan.get("enrichment_urls") or []
+    if not isinstance(enrich_raw, list):
+        enrich_raw = []
+    enrich: list[str] = []
+    seen_e: set[str] = set()
+    cap = max(0, int(settings.batch_enrichment_url_cap))
+    for u in enrich_raw:
+        if len(enrich) >= cap:
+            break
+        s = str(u).strip()
+        if not s:
+            continue
+        key = _normalize_map_url_key(s)
+        if key in seen_e:
+            continue
+        seen_e.add(key)
+        if not _url_matches_configured_site(s, base_url):
+            continue
+        if s.rstrip("/") == base_url.rstrip("/"):
+            continue
+        if dir_url and s.rstrip("/") == dir_url.rstrip("/"):
+            continue
+        enrich.append(_normalize_map_url_key(s))
+
+    include_home = bool(plan.get("include_homepage", True))
+    base_norm = _normalize_map_url_key(base_url)
+    dir_is_home = bool(dir_url and _normalize_map_url_key(dir_url) == base_norm)
+
+    dir_page: dict | None = None
+    if dir_url:
+        content = await scrape_page(dir_url, fc_usage, interact_priority=True)
+        if content and len(content.strip()) > 30:
+            dir_page = {"url": dir_url, "content": content}
+
+    rest_specs: list[tuple[str, bool]] = []
+    if include_home and not dir_is_home:
+        rest_specs.append((base_url, False))
+    rest_specs.extend([(u, False) for u in enrich])
+
+    max_total = max(1, int(settings.batch_max_scrape_urls))
+    used_dir = 1 if dir_page else 0
+    rest_cap = max(0, max_total - used_dir)
+    rest_specs = rest_specs[:rest_cap]
+
+    rest_pages = await scrape_pages_with_interact_flags(rest_specs, fc_usage)
+    home_pages = [
+        p for p in rest_pages
+        if _normalize_map_url_key(p.get("url") or "") == _normalize_map_url_key(base_url)
+    ]
+    other_pages = [
+        p for p in rest_pages
+        if _normalize_map_url_key(p.get("url") or "") != _normalize_map_url_key(base_url)
+    ]
+
+    assembled: list[dict] = []
+    if si_text:
+        assembled.append({"url": f"{base_url} [SchoolInsites API]", "content": si_text})
+    if dir_page:
+        assembled.append(dir_page)
+    assembled.extend(other_pages)
+    assembled.extend(home_pages)
+    return assembled
+
+
+async def _scrape_district_heuristic_fallback(base_url: str, fc_usage: dict) -> list[dict]:
+    """Original map → score → parallel scrape pipeline when triage is skipped or fails."""
+    settings = get_settings()
+    subpage_urls = await discover_urls(
+        base_url,
+        max_urls=settings.batch_max_target_pages,
+        usage=fc_usage,
+    )
+    all_urls = [base_url] + [
+        u for u in subpage_urls
+        if u.rstrip("/") != base_url.rstrip("/") and _url_matches_configured_site(u, base_url)
+    ]
+    pages = await scrape_pages(all_urls, fc_usage)
+    print(f"[firecrawl] Scraped {len(pages)} pages for {base_url} (heuristic)")
+
+    if not subpage_urls:
+        print(f"[firecrawl] map found no subpages — using HTML fallback for subpage discovery on {base_url}")
+        homepage_html = await _fetch_html(base_url)
+
+        if homepage_html and len(homepage_html) > 100:
+            discovered = _discover_subpage_urls_from_html(
+                homepage_html, base_url, max_urls=settings.batch_max_target_pages
+            )
+            print(f"[firecrawl] HTML fallback discovered {len(discovered)} candidate subpage URLs for {base_url}")
+
+            if discovered:
+                fc_subpages = await scrape_pages(discovered, fc_usage)
+                if fc_subpages:
+                    print(f"[firecrawl] Firecrawl scraped {len(fc_subpages)} discovered subpages for {base_url}")
+                    pages.extend(fc_subpages)
+                else:
+                    direct_subpages = await _fetch_pages_direct(discovered)
+                    print(f"[firecrawl] direct HTTP fetched {len(direct_subpages)} subpages for {base_url}")
+                    pages.extend(direct_subpages)
+
+        if not pages:
+            homepage_html = homepage_html or await _fetch_html(base_url)
+            if homepage_html and len(homepage_html) > 100:
+                pages.append({"url": f"{base_url} [direct_fallback]", "content": homepage_html})
+
+    si_text = await _fetch_schoolinsites_directory(base_url)
+    if si_text:
+        pages.insert(0, {"url": f"{base_url} [SchoolInsites API]", "content": si_text})
+
     return pages
 
 
@@ -869,72 +1163,96 @@ async def _fetch_pages_direct(urls: list[str]) -> list[dict]:
 async def scrape_district(
     base_url: str,
     usage: dict | None = None,
-) -> tuple[list[dict], dict]:
+    *,
+    district_name: str | None = None,
+    district_state: str | None = None,
+    batch_agent: BatchExtractionAgent | None = None,
+) -> tuple[list[dict], dict, dict | None]:
     """
-    Full pipeline for a single district:
-    1. Use Firecrawl map to discover relevant subpage URLs.
-    2. Scrape homepage + top subpages in parallel via Firecrawl.
-    3. If map found no subpages, fall back to HTML-based link discovery and
-       scrape those pages (Firecrawl first, direct HTTP if that also fails).
-    4. Supplement with SchoolInsites direct API if detected.
+    Directory-first pipeline when ``district_name`` and ``batch_agent`` are set:
+    map (rich metadata) → cheap LLM URL triage → SchoolInsites API + prioritized
+    directory scrape (interact-friendly) → enrichment URLs + optional homepage.
 
-    Returns ``(pages, firecrawl_usage)`` where pages are ``{"url", "content"}``
-    dicts for the batch extraction agent. ``firecrawl_usage`` aggregates API
-    calls for Slack cost estimates (optional interact on thin directory pages).
+    Otherwise uses the legacy heuristic map/score pipeline (same as triage fallback).
+
+    Returns ``(pages, firecrawl_usage, url_triage_meta)``. ``url_triage_meta`` is
+    None only if triage was skipped and no summary dict was produced; usually a
+    dict with ``used_heuristic``, ``staff_directory_url``, ``enrichment_urls``,
+    ``triage_usage``, and ``rationale``.
     """
     settings = get_settings()
     fc_usage = usage if usage is not None else new_firecrawl_usage()
     print(f"[firecrawl] Starting scrape for {base_url}")
 
-    # Step 1: discover target URLs via Firecrawl map
-    subpage_urls = await discover_urls(
-        base_url,
-        max_urls=settings.batch_max_target_pages,
-        usage=fc_usage,
+    triage_meta: dict | None = None
+
+    def _fill_triage_tokens(meta: dict | None) -> None:
+        if not meta:
+            return
+        tu = meta.get("triage_usage")
+        if isinstance(tu, dict):
+            meta["triage_in_tokens"] = int(tu.get("input_tokens") or 0)
+            meta["triage_out_tokens"] = int(tu.get("output_tokens") or 0)
+
+    name_ok = bool((district_name or "").strip())
+    use_triage = (
+        batch_agent is not None
+        and name_ok
+        and bool(settings.anthropic_api_key)
     )
 
-    # Always include homepage; deduplicate. Keep only the configured primary host
-    # (www vs non-www), never sibling subdomains from map (not cache — map/sitemap).
-    all_urls = [base_url] + [
-        u for u in subpage_urls
-        if u.rstrip("/") != base_url.rstrip("/") and _url_matches_configured_site(u, base_url)
-    ]
-
-    # Step 2: scrape all pages in parallel via Firecrawl
-    pages = await scrape_pages(all_urls, fc_usage)
-    print(f"[firecrawl] Scraped {len(pages)} pages for {base_url}")
-
-    # Step 3: if Firecrawl map found no subpages (or total pages still < 2),
-    # use direct HTML to discover subpages and fetch them. This runs even if the
-    # homepage was scraped — we still need subpages to find contacts.
-    if not subpage_urls:
-        print(f"[firecrawl] map found no subpages — using HTML fallback for subpage discovery on {base_url}")
-        homepage_html = await _fetch_html(base_url)
-
-        if homepage_html and len(homepage_html) > 100:
-            discovered = _discover_subpage_urls_from_html(
-                homepage_html, base_url, max_urls=settings.batch_max_target_pages
+    if use_triage:
+        link_items = await discover_map_candidates(base_url, usage=fc_usage)
+        if link_items:
+            plan, tri_usage = batch_agent.triage_urls_from_map(
+                district_name=(district_name or "").strip(),
+                district_state=(district_state or "").strip() or None,
+                homepage_url=base_url,
+                candidates=link_items,
             )
-            print(f"[firecrawl] HTML fallback discovered {len(discovered)} candidate subpage URLs for {base_url}")
+            triage_meta = {
+                "used_heuristic": False,
+                "staff_directory_url": plan.get("staff_directory_url"),
+                "enrichment_urls": list(plan.get("enrichment_urls") or []),
+                "include_homepage": bool(plan.get("include_homepage", True)),
+                "rationale": (plan.get("rationale") or "")[:500],
+                "triage_usage": tri_usage,
+            }
+            if _url_triage_plan_usable(plan):
+                rationale_preview = (plan.get("rationale") or "")[:120]
+                print(
+                    f"[firecrawl] URL triage: dir={plan.get('staff_directory_url')!r} "
+                    f"enrich={len(plan.get('enrichment_urls') or [])} "
+                    f"home={plan.get('include_homepage', True)} "
+                    f"rationale={rationale_preview!r}"
+                )
+                pages = await _scrape_district_triage_path(base_url, fc_usage, plan)
+                if pages:
+                    _fill_triage_tokens(triage_meta)
+                    return pages, fc_usage, triage_meta
+                print("[firecrawl] Triage path returned no pages — heuristic fallback")
+            triage_meta["used_heuristic"] = True
+            print("[firecrawl] URL triage plan unusable or empty scrape — heuristic fallback")
+        else:
+            triage_meta = {
+                "used_heuristic": True,
+                "staff_directory_url": None,
+                "enrichment_urls": [],
+                "include_homepage": True,
+                "rationale": "no map candidates for triage",
+                "triage_usage": {},
+            }
+            print("[firecrawl] No map candidates — heuristic fallback")
 
-            if discovered:
-                fc_subpages = await scrape_pages(discovered, fc_usage)
-                if fc_subpages:
-                    print(f"[firecrawl] Firecrawl scraped {len(fc_subpages)} discovered subpages for {base_url}")
-                    pages.extend(fc_subpages)
-                else:
-                    direct_subpages = await _fetch_pages_direct(discovered)
-                    print(f"[firecrawl] direct HTTP fetched {len(direct_subpages)} subpages for {base_url}")
-                    pages.extend(direct_subpages)
-
-        if not pages:
-            homepage_html = homepage_html or await _fetch_html(base_url)
-            if homepage_html and len(homepage_html) > 100:
-                pages.append({"url": f"{base_url} [direct_fallback]", "content": homepage_html})
-
-    # Step 4: SchoolInsites supplement (check homepage)
-    si_text = await _fetch_schoolinsites_directory(base_url)
-    if si_text:
-        pages.insert(0, {"url": f"{base_url} [SchoolInsites API]", "content": si_text})
-
-    return pages, fc_usage
+    pages = await _scrape_district_heuristic_fallback(base_url, fc_usage)
+    if triage_meta is None:
+        triage_meta = {
+            "used_heuristic": True,
+            "staff_directory_url": None,
+            "enrichment_urls": [],
+            "include_homepage": True,
+            "rationale": "triage skipped (no district name, agent, or Anthropic key)",
+            "triage_usage": {},
+        }
+    _fill_triage_tokens(triage_meta)
+    return pages, fc_usage, triage_meta

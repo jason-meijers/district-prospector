@@ -2,6 +2,8 @@ from __future__ import annotations
 import json
 import re
 import time
+from urllib.parse import urlparse
+
 import anthropic
 from app.config import get_settings
 
@@ -19,7 +21,7 @@ ID 471 → CTE Director
 ID 467 → Assistant CTE Director
 ID 470 → CTE Coordinator
 ID 480 → Principal (secondary/high school only)
-ID 474 → Director (use for Director of Secondary Education, Director of Learning and Instruction, and similar senior director roles that don't fit a more specific category above)
+ID 474 → Director (**only** curriculum / instruction / teaching & learning / secondary education / CTE leadership — not facilities, finance, HR, technology, security, fine arts, athletics, or other non-academic departments)
 ID 478 → Other (last resort only)
 """
 
@@ -52,7 +54,11 @@ SKIP any person whose title explicitly references:
 - Elementary, Primary, K-5, Grades 1-6, or Middle School (e.g. "Elementary Principal", "Director of K-5 Curriculum", "Middle School CTE Coordinator")
 - Board members or trustees
 - Teachers, counselors, coaches, nurses
-- HR, Human Resources, Finance, Accounting, Business, Facilities, Operations, Maintenance, IT, Technology, Transportation
+- HR, Human Resources, Finance, Accounting, Business, Facilities, Operations, Maintenance, Construction, Custodial, Grounds, IT, Technology, Transportation
+- Police, SRO, security, safety (except curriculum/safety coordination that is clearly instructional)
+- Purchasing, procurement, vendor management, food service, nutrition
+- Fine arts, band, choir, theater, athletics, sports (unless a later product flag explicitly allows arts)
+- Corporate relations, partnerships, foundation, communications/marketing **unless** the role is clearly instructional leadership
 
 ## Role Category Assignment
 
@@ -111,6 +117,89 @@ Return ONLY valid JSON — no markdown, no explanation.
 }}
 
 IMPORTANT: Only return real human names. Never treat page labels, navigation items, department names, or image descriptions as person names."""
+
+BATCH_URL_TRIAGE_SYSTEM = """You pick which URLs to scrape for **district leadership and curriculum/CTE contacts** for a U.S. K-12 school district.
+
+You receive the district name, homepage URL, and a **numbered list of candidate URLs** discovered via the site map (each with optional title/description). You must **only** choose URLs whose path appears in that list — copy the `url` value **exactly** as given (same string).
+
+**staff_directory_url**: The single best page that lists **many district staff** (district directory, staff directory, faculty/staff listing, leadership team with multiple names, "our team", etc.). Prefer district-wide directories over a single school. Set to `null` if none of the candidates clearly fit.
+
+**enrichment_urls**: Up to the allowed count of **extra** pages that help find superintendent, curriculum/instruction leaders, CTE, or district office contacts — e.g. leadership, administration, curriculum & instruction, CTE, human resources **only if** it clearly lists district cabinet/leadership contacts, "contact us", about/district administration. Do **not** pick: police, security, athletics-only, elementary-only pages, fine arts, maintenance, facilities, purchasing, board policy-only, calendars, news.
+
+**include_homepage**: `true` if we should also scrape the homepage for superintendent name, main phone, or district office info (default `true` unless the homepage is useless and everything needed is on other chosen URLs).
+
+**rationale**: One short sentence for logs.
+
+Output **only** valid JSON with these keys:
+{"staff_directory_url": null or string, "enrichment_urls": [], "include_homepage": true, "rationale": "string"}
+No markdown fences."""
+
+
+def _normalize_triage_url(u: str) -> str:
+    try:
+        p = urlparse((u or "").strip())
+        if not p.netloc:
+            return (u or "").strip().rstrip("/")
+        return f"{p.scheme or 'https'}://{p.netloc.lower()}{p.path}".rstrip("/")
+    except Exception:
+        return (u or "").strip().rstrip("/")
+
+
+def _sanitize_triage_plan(
+    parsed: dict | None,
+    allowed: set[str],
+    homepage_key: str,
+    enrich_cap: int,
+) -> dict:
+    """Keep only URLs present in ``allowed``; enforce enrichment cap."""
+    out: dict = {
+        "staff_directory_url": None,
+        "enrichment_urls": [],
+        "include_homepage": True,
+        "rationale": "",
+    }
+    if not parsed or not isinstance(parsed, dict):
+        out["rationale"] = "invalid_or_empty_json"
+        return out
+
+    out["rationale"] = str(parsed.get("rationale") or "")[:500]
+
+    su = parsed.get("staff_directory_url")
+    if su:
+        key = _normalize_triage_url(str(su))
+        if key in allowed:
+            out["staff_directory_url"] = key
+
+    raw_enrich = parsed.get("enrichment_urls")
+    if isinstance(raw_enrich, list):
+        seen: set[str] = set()
+        for item in raw_enrich:
+            if len(out["enrichment_urls"]) >= max(0, enrich_cap):
+                break
+            key = _normalize_triage_url(str(item))
+            if not key or key == homepage_key:
+                continue
+            if out["staff_directory_url"] and key == out["staff_directory_url"]:
+                continue
+            if key not in allowed:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            out["enrichment_urls"].append(key)
+
+    ih = parsed.get("include_homepage")
+    if ih is False:
+        out["include_homepage"] = False
+    elif ih is True:
+        out["include_homepage"] = True
+
+    if out["staff_directory_url"] and out["staff_directory_url"] == homepage_key:
+        # Homepage as directory is valid; avoid duplicating in enrichment list (handled in scraper).
+        pass
+
+    return out
+
 
 _PHONE_NEAR_LABEL = re.compile(
     r"(?:phone|telephone|tel\.?|district\s+office|central\s+office|main\s+office|board\s+office)\s*[:\s]+"
@@ -425,6 +514,136 @@ class BatchExtractionAgent:
                 return None, {}
 
         return None, {}
+
+    def _call_claude_triage(self, user_message: str, max_tokens: int = 512) -> tuple[str | None, dict]:
+        """
+        Cheap model URL triage — no prompt caching (small system prompt).
+        """
+        max_retries = 3
+        retry_delay = 60
+
+        for attempt in range(max_retries):
+            try:
+                response = self.client.messages.create(
+                    model=self.settings.batch_url_triage_model,
+                    max_tokens=max_tokens,
+                    system=BATCH_URL_TRIAGE_SYSTEM,
+                    messages=[{"role": "user", "content": user_message}],
+                )
+
+                usage: dict = {}
+                if getattr(response, "usage", None):
+                    u = response.usage
+                    usage = {
+                        "input_tokens": getattr(u, "input_tokens", 0) or 0,
+                        "output_tokens": getattr(u, "output_tokens", 0) or 0,
+                        "cache_creation_input_tokens": getattr(
+                            u, "cache_creation_input_tokens", 0
+                        )
+                        or 0,
+                        "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", 0)
+                        or 0,
+                    }
+
+                content = getattr(response, "content", None) or []
+                text_parts = []
+                for block in content if isinstance(content, list) else []:
+                    if block is None:
+                        continue
+                    t = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+                    if t:
+                        text_parts.append(t)
+                text = " ".join(text_parts).strip() or None
+                return text, usage
+
+            except anthropic.RateLimitError as e:
+                if attempt < max_retries - 1:
+                    wait = retry_delay * (2**attempt)
+                    print(
+                        f"[batch_agent] Triage rate limit — waiting {wait}s (attempt {attempt + 2}/{max_retries}): {e}"
+                    )
+                    time.sleep(wait)
+                else:
+                    print("[batch_agent] Triage rate limit — all retries exhausted")
+                    raise
+            except Exception as e:
+                print(f"[batch_agent] Triage Claude call failed: {type(e).__name__}: {e}")
+                return None, {}
+
+        return None, {}
+
+    def triage_urls_from_map(
+        self,
+        district_name: str,
+        district_state: str | None,
+        homepage_url: str,
+        candidates: list[dict],
+    ) -> tuple[dict, dict]:
+        """
+        Select staff directory + enrichment URLs from map metadata via a cheap LLM.
+        Only URLs present in ``candidates`` may appear in the result.
+
+        Returns:
+            (plan_dict, usage_dict); plan has staff_directory_url, enrichment_urls,
+            include_homepage, rationale.
+        """
+        empty_usage: dict = {}
+        if not candidates:
+            return {
+                "staff_directory_url": None,
+                "enrichment_urls": [],
+                "include_homepage": True,
+                "rationale": "no_candidates",
+            }, empty_usage
+
+        home_key = _normalize_triage_url(homepage_url)
+        allowed: set[str] = {home_key}
+        for row in candidates:
+            u = (row.get("url") or "").strip()
+            if u:
+                allowed.add(_normalize_triage_url(u))
+
+        lines: list[str] = []
+        for i, row in enumerate(candidates, 1):
+            u = row.get("url") or ""
+            t = (row.get("title") or "").replace("\n", " ")[:200]
+            d = (row.get("description") or "").replace("\n", " ")[:250]
+            lines.append(f"{i}. url: {u}\n   title: {t}\n   desc: {d}")
+
+        loc = f", {district_state}" if district_state else ""
+        user_message = (
+            f"District: {district_name}{loc}\n"
+            f"Homepage: {home_key}\n"
+            f"Max enrichment URLs to return (hard cap): {self.settings.batch_enrichment_url_cap}\n\n"
+            f"Candidates:\n"
+            + "\n\n".join(lines)
+            + "\n\nReturn JSON only."
+        )
+
+        raw, usage = self._call_claude_triage(user_message)
+        if not raw:
+            return {
+                "staff_directory_url": None,
+                "enrichment_urls": [],
+                "include_homepage": True,
+                "rationale": "triage_no_response",
+            }, usage
+
+        parsed: dict | None = None
+        try:
+            cleaned = (
+                raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            )
+            parsed = json.loads(cleaned)
+            if not isinstance(parsed, dict):
+                parsed = None
+        except json.JSONDecodeError as e:
+            print(f"[batch_agent] Triage JSON parse error: {e}")
+            print(f"[batch_agent] Triage raw (first 400 chars): {raw[:400]}")
+
+        cap = max(0, int(self.settings.batch_enrichment_url_cap))
+        plan = _sanitize_triage_plan(parsed, allowed, home_key, cap)
+        return plan, usage
 
     def extract_contacts_raw(
         self,
