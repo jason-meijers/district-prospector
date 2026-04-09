@@ -21,7 +21,7 @@ ID 471 → CTE Director
 ID 467 → Assistant CTE Director
 ID 470 → CTE Coordinator
 ID 480 → Principal (secondary/high school only)
-ID 474 → Director (**only** curriculum / instruction / teaching & learning / secondary education / CTE leadership — not facilities, finance, HR, technology, security, fine arts, athletics, or other non-academic departments)
+ID 474 → Director (**only** curriculum / instruction / teaching & learning / secondary education / CTE leadership — not facilities, finance, HR, technology, security, fine arts, athletics, equity & inclusion, MTSS, expeditions/enrichment-only programs, or other non-academic departments)
 ID 478 → Other (last resort only)
 """
 
@@ -48,6 +48,10 @@ Extract people who hold these roles (exact titles and reasonable equivalents):
 **Secondary / High School:**
 - Principal (HIGH SCHOOL or SECONDARY only), Director of Secondary Education, Director of High School Programs
 
+**Director titles (important):**
+- **Executive Director** is acceptable when it denotes district or academic-program leadership aligned with our targets (e.g. instructional services, CTE, secondary programs).
+- **Director of [something]** — include **only** if that something is clearly **curriculum, instruction, teaching & learning, secondary education, CTE, career pathways, or academic services**. Do **not** include directors of unrelated programs (examples below).
+
 ## Critical Exclusions
 
 SKIP any person whose title explicitly references:
@@ -59,6 +63,9 @@ SKIP any person whose title explicitly references:
 - Purchasing, procurement, vendor management, food service, nutrition
 - Fine arts, band, choir, theater, athletics, sports (unless a later product flag explicitly allows arts)
 - Corporate relations, partnerships, foundation, communications/marketing **unless** the role is clearly instructional leadership
+- **Equity & Inclusion** leadership (e.g. Director of Equity & Inclusion, Chief Diversity Officer) — not a target role
+- **MTSS** roles (e.g. MTSS Coordinator, Multi-Tiered System of Supports)
+- **Expeditions** or similar enrichment-only program directors (e.g. Director of Expeditions) — not curriculum/CTE/secondary leadership
 
 ## Role Category Assignment
 
