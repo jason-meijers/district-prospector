@@ -1,6 +1,7 @@
 from __future__ import annotations
-import httpx
 import json
+import re
+import httpx
 from app.config import (
     get_settings,
     PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY,
@@ -21,6 +22,59 @@ def slack_plaintext_no_autolink(value: str | None) -> str:
     if "`" in s:
         s = s.replace("`", "'")
     return f"`{s}`"
+
+
+def sanitize_email_for_pipedrive(raw: str | None) -> str | None:
+    """Strip mailto: / HTML junk from scraped or pasted values."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    s = s.rstrip(">").strip()
+    low = s.lower()
+    if low.startswith("mailto:"):
+        s = s[7:].strip()
+    if "?" in s and "@" in s:
+        s = s.split("?", 1)[0].strip()
+    return s if "@" in s else None
+
+
+def sanitize_phone_for_pipedrive(raw: str | None) -> str | None:
+    """
+    Strip tel: URIs and fix duplicate US numbers when href + visible text were concatenated.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    s = s.rstrip(">").strip()
+    if s.lower().startswith("tel:"):
+        s = s[4:].strip()
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return None
+    # e.g. same 10-digit US number twice: 98974334719897433471
+    if len(digits) == 20 and digits[:10] == digits[10:]:
+        digits = digits[:10]
+    elif len(digits) == 22 and digits[0] == "1" and digits[:11] == digits[11:]:
+        digits = digits[:11]
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    if len(digits) == 11 and digits[0] == "1":
+        d = digits[1:]
+        return f"{d[:3]}-{d[3:6]}-{d[6:]}"
+    # Non-US or extension: return digits-only or lightly cleaned original
+    return s
+
+
+def format_slack_source_url_line(source_url: str | None) -> str:
+    """Plain URL in backticks — avoids <url|label> breaking when users copy/paste."""
+    u = (source_url or "").strip()
+    if not u:
+        return "📄 Source: N/A"
+    return f"📄 Source: {slack_plaintext_no_autolink(u)}"
 
 
 class SlackClient:
@@ -130,17 +184,17 @@ class SlackClient:
 
     def format_new_contact(self, contact: dict, org_id: int, date_str: str) -> str:
         role_field_key = PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY
-        if contact.get("email"):
+        email_val = sanitize_email_for_pipedrive(contact.get("email"))
+        phone_val = sanitize_phone_for_pipedrive(contact.get("phone"))
+        if email_val:
             email_display = (
-                f"{slack_plaintext_no_autolink(contact['email'])} "
+                f"{slack_plaintext_no_autolink(email_val)} "
                 f"_({contact.get('email_confidence', 'low')} confidence)_"
             )
         else:
             email_display = "Not found"
         phone_display = (
-            slack_plaintext_no_autolink(contact["phone"])
-            if contact.get("phone")
-            else "Not found"
+            slack_plaintext_no_autolink(phone_val) if phone_val else "Not found"
         )
 
         # Strip a recognised salutation from the name and map it to the
@@ -170,10 +224,10 @@ class SlackClient:
             "job_title": contact["job_title"],
             "custom_fields": custom_fields,
         }
-        if contact.get("email"):
-            body["emails"] = [{"value": contact["email"], "primary": True, "label": "work"}]
-        if contact.get("phone"):
-            body["phones"] = [{"value": contact["phone"], "primary": True, "label": "work"}]
+        if email_val:
+            body["emails"] = [{"value": email_val, "primary": True, "label": "work"}]
+        if phone_val:
+            body["phones"] = [{"value": phone_val, "primary": True, "label": "work"}]
 
         note_content = (
             f"Prospecting Bot: {contact['name']} added from district website.\n"
@@ -182,8 +236,7 @@ class SlackClient:
             f"Agent notes: {contact.get('notes', '')}\n"
             f"Researched: {date_str}"
         )
-        source_url = contact.get("source_url") or ""
-        source_line = f"📄 Source: <{source_url}|View page>" if source_url else "📄 Source: N/A"
+        source_line = format_slack_source_url_line(contact.get("source_url"))
         person_body_json = json.dumps(body, indent=2)
         role_label = contact.get("role_category_label") or contact.get("role_category") or "N/A"
 
@@ -231,18 +284,21 @@ class SlackClient:
                 role_id = best_match_id or 478
             body.setdefault("custom_fields", {})
             body["custom_fields"][PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY] = role_id
-        if "email" in contact.get("changes", []) and contact.get("email"):
-            body["emails"] = [{"value": contact["email"], "primary": True, "label": "work"}]
-        if "phone" in contact.get("changes", []) and contact.get("phone"):
-            body["phones"] = [{"value": contact["phone"], "primary": True, "label": "work"}]
+        if "email" in contact.get("changes", []):
+            ev = sanitize_email_for_pipedrive(contact.get("email"))
+            if ev:
+                body["emails"] = [{"value": ev, "primary": True, "label": "work"}]
+        if "phone" in contact.get("changes", []):
+            pv = sanitize_phone_for_pipedrive(contact.get("phone"))
+            if pv:
+                body["phones"] = [{"value": pv, "primary": True, "label": "work"}]
 
         note_content = (
             f"Prospecting Bot: Updated {contact['name']} on {date_str}.\n"
             f"Source: {contact.get('source_url', 'N/A')}\n"
             f"Agent notes: {contact.get('notes', '')}"
         )
-        source_url = contact.get("source_url") or ""
-        source_line = f"📄 Source: <{source_url}|View page>" if source_url else "📄 Source: N/A"
+        source_line = format_slack_source_url_line(contact.get("source_url"))
         person_body_json = json.dumps(body, indent=2)
         person_id = contact['pipedrive_person_id']
         return (
@@ -272,8 +328,11 @@ class SlackClient:
         )
 
     def format_confirmed_contact(self, contact: dict) -> str:
-        source_url = contact.get("source_url") or ""
-        source_line = f"📄 Confirmed on: <{source_url}|View page>" if source_url else "📄 Source: N/A"
+        u = (contact.get("source_url") or "").strip()
+        if u:
+            source_line = f"📄 Confirmed on: {slack_plaintext_no_autolink(u)}"
+        else:
+            source_line = "📄 Source: N/A"
         return (
             f"✅ *CONFIRMED: {contact['name']}*\n"
             f"📋 Title: {contact['job_title']}\n"
