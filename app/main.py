@@ -129,6 +129,7 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         )
 
         # ── Step 2: Run extraction ───────────────────────────────
+        website_fallback_used = False
         if use_batch_pipeline:
             result = await run_firecrawl_research(
                 org_name=org_name,
@@ -140,6 +141,34 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
             result = await agent.run(org_name, website_url, existing_contacts, all_person_names)
         else:
             result = {"error": "No extraction pipeline available"}
+
+        # Stored URL may be wrong, blocked, or empty — same as batch_runner: search for an official URL and retry once.
+        err_msg = result.get("error") if isinstance(result, dict) else None
+        if err_msg and "No readable pages found" in err_msg:
+            print(
+                f"[pipeline] No readable pages on {website_url} — "
+                f"attempting Firecrawl search for alternate official URL..."
+            )
+            fallback_url = await discover_district_website(org_name)
+            if fallback_url and fallback_url.rstrip("/") != website_url.rstrip("/"):
+                print(f"[pipeline] Retrying research with discovered URL: {fallback_url}")
+                try:
+                    await pipedrive.update_org_website(org_id, fallback_url)
+                except Exception as e:
+                    print(f"[pipeline] Failed to write rediscovered website to Pipedrive: {e}")
+                website_url = fallback_url
+                website_fallback_used = True
+                if use_batch_pipeline:
+                    result = await run_firecrawl_research(
+                        org_name=org_name,
+                        website_url=website_url,
+                        existing_contacts=existing_contacts,
+                        all_person_names=all_person_names,
+                    )
+                elif agent:
+                    result = await agent.run(
+                        org_name, website_url, existing_contacts, all_person_names
+                    )
 
         if "error" in result:
             await slack.post_message(
@@ -171,6 +200,11 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         )
         if website_was_discovered:
             parent_text += f"\n\n🔍 _Website was not on file — discovered via search and saved to Pipedrive._"
+        if website_fallback_used:
+            parent_text += (
+                "\n\n⚠️ _The URL on file returned no usable pages — retried with a URL from "
+                "search and saved to Pipedrive._"
+            )
         thread_ts = await slack.post_message(parent_text)
 
         if not thread_ts:
