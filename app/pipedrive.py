@@ -45,15 +45,8 @@ class PipedriveClient:
             return data.get("data", {})
 
     async def update_org_website(self, org_id: int, url: str) -> dict:
-        """
-        Write a discovered website URL back to the organization.
-
-        Sets both the standard Pipedrive ``website`` field (what shows in the
-        default org UI) and the custom field ``PIPEDRIVE_WEBSITE_FIELD_KEY``
-        so reads and sync stay consistent.
-        """
-        fields = {"website": url, PIPEDRIVE_WEBSITE_FIELD_KEY: url}
-        return await self.update_organization(org_id, fields)
+        """Write the URL to the organization's built-in ``website`` field only."""
+        return await self.update_organization(org_id, {"website": url})
 
     async def get_org_persons(self, org_id: int) -> list[dict]:
         """Fetch all persons linked to an organization."""

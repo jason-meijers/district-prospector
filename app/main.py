@@ -130,6 +130,7 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
 
         # ── Step 2: Run extraction ───────────────────────────────
         website_fallback_used = False
+        website_fallback_saved_to_pipedrive = False
         if use_batch_pipeline:
             result = await run_firecrawl_research(
                 org_name=org_name,
@@ -154,6 +155,7 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
                 print(f"[pipeline] Retrying research with discovered URL: {fallback_url}")
                 try:
                     await pipedrive.update_org_website(org_id, fallback_url)
+                    website_fallback_saved_to_pipedrive = True
                 except Exception as e:
                     print(f"[pipeline] Failed to write rediscovered website to Pipedrive: {e}")
                 website_url = fallback_url
@@ -199,12 +201,21 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
             missing=len(missing),
         )
         if website_was_discovered:
-            parent_text += f"\n\n🔍 _Website was not on file — discovered via search and saved to Pipedrive._"
-        if website_fallback_used:
             parent_text += (
-                "\n\n⚠️ _The URL on file returned no usable pages — retried with a URL from "
-                "search and saved to Pipedrive._"
+                "\n\n🔍 _Website was not on file — discovered via search and saved to the org "
+                "Website field in Pipedrive._"
             )
+        if website_fallback_used:
+            if website_fallback_saved_to_pipedrive:
+                parent_text += (
+                    "\n\n⚠️ _The URL on file returned no usable pages — retried with a URL from "
+                    "search and saved to the org Website field in Pipedrive._"
+                )
+            else:
+                parent_text += (
+                    "\n\n⚠️ _The URL on file returned no usable pages — retried with a URL from "
+                    "search. Saving that URL to Pipedrive failed; check server logs._"
+                )
         thread_ts = await slack.post_message(parent_text)
 
         if not thread_ts:
