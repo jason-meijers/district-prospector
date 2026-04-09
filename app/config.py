@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     # Directory-first pipeline: map candidate count, cheap LLM URL triage, post-triage scrape caps
     batch_map_candidate_limit: int = 50
     batch_triage_max_candidates: int = 45
-    batch_url_triage_model: str = "claude-3-5-haiku-20241022"
+    batch_url_triage_model: str = "claude-haiku-4-5"
     batch_max_scrape_urls: int = 8
     batch_enrichment_url_cap: int = 5
 

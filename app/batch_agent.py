@@ -566,6 +566,8 @@ class BatchExtractionAgent:
                 else:
                     print("[batch_agent] Triage rate limit — all retries exhausted")
                     raise
+            except anthropic.NotFoundError:
+                raise
             except Exception as e:
                 print(f"[batch_agent] Triage Claude call failed: {type(e).__name__}: {e}")
                 return None, {}
