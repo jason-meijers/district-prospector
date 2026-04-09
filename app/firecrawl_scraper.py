@@ -17,7 +17,6 @@ for (let p = 0; p < maxPages; p++) {
   const txt = await page.evaluate(() => (document.body && document.body.innerText) ? document.body.innerText : '');
   chunks.push('--- Page ' + (p + 1) + ' ---\n' + String(txt).slice(0, 60000));
   if (p >= maxPages - 1) break;
-  const urlBefore = page.url();
   let clicked = false;
   const selectors = [
     'a[rel="next"]',
@@ -26,6 +25,7 @@ for (let p = 0; p < maxPages; p++) {
     'a.pagination-next',
     '.pagination a.next',
     'a[class*="next" i]',
+    'a.fsNextPageLink',
   ];
   for (const sel of selectors) {
     try {
@@ -41,7 +41,8 @@ for (let p = 0; p < maxPages; p++) {
     } catch (e) {}
   }
   if (!clicked) break;
-  if (page.url() === urlBefore) break;
+  // Same-URL pagination (SPAs / in-place updates): URL often unchanged; do not stop early.
+  await page.waitForTimeout(900);
 }
 JSON.stringify({ markdown: chunks.join('\n\n') });
 """
