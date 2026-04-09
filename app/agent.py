@@ -68,7 +68,7 @@ CRITICAL — Valid person names only: A "name" must be a real human name (e.g. "
 
 Do NOT include: principals, vice principals, teachers, counselors, board members (trustees), business/finance roles, HR roles, facilities/operations roles, or IT/technology roles unless their title explicitly includes curriculum, instruction, or CTE oversight.
 
-Do NOT include: Director of Equity & Inclusion (or similar equity/diversity-only leadership), MTSS Coordinator (or MTSS-only roles), Director of Expeditions (or similar enrichment-only program directors). **Executive Director** is acceptable when it clearly supports curriculum, instruction, CTE, or district academic leadership. **Director of [X]** — include only when X is clearly curriculum, instruction, teaching & learning, secondary education, CTE, or academic services — not unrelated director portfolios.
+Do NOT include: Director of Equity & Inclusion (or similar equity/diversity-only leadership), MTSS Coordinator (or MTSS-only roles), Director of Expeditions (or similar enrichment-only program directors), gifted/talented or GATE program coordinators (e.g. Coordinator of Gifted and Learning). **Executive Director** is acceptable when it clearly supports curriculum, instruction, CTE, or district academic leadership. **Director of [X]** — include only when X is clearly curriculum, instruction, teaching & learning, secondary education, CTE, or academic services — not unrelated director portfolios.
 
 ## Role Category Assignment
 

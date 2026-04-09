@@ -21,7 +21,7 @@ ID 471 → CTE Director
 ID 467 → Assistant CTE Director
 ID 470 → CTE Coordinator
 ID 480 → Principal (secondary/high school only)
-ID 474 → Director (**only** curriculum / instruction / teaching & learning / secondary education / CTE leadership — not facilities, finance, HR, technology, security, fine arts, athletics, equity & inclusion, MTSS, expeditions/enrichment-only programs, or other non-academic departments)
+ID 474 → Director (**only** curriculum / instruction / teaching & learning / secondary education / CTE leadership — not facilities, finance, HR, technology, security, fine arts, athletics, equity & inclusion, MTSS, expeditions/enrichment-only programs, gifted/GATE-only program roles, or other non-academic departments)
 ID 478 → Other (last resort only)
 """
 
@@ -66,6 +66,7 @@ SKIP any person whose title explicitly references:
 - **Equity & Inclusion** leadership (e.g. Director of Equity & Inclusion, Chief Diversity Officer) — not a target role
 - **MTSS** roles (e.g. MTSS Coordinator, Multi-Tiered System of Supports)
 - **Expeditions** or similar enrichment-only program directors (e.g. Director of Expeditions) — not curriculum/CTE/secondary leadership
+- **Gifted & talented / GATE / advanced learning** program staff (e.g. Coordinator of Gifted and Learning, Gifted Coordinator) — not a target role
 
 ## Role Category Assignment
 
