@@ -10,6 +10,19 @@ from app.config import (
 )
 
 
+def slack_plaintext_no_autolink(value: str | None) -> str:
+    """
+    Slack clients auto-link emails (mailto) and phone numbers (tel), which breaks
+    copy/paste into Pipedrive. Inline code (backticks) suppresses that behavior.
+    """
+    if value is None or value == "":
+        return value or ""
+    s = str(value)
+    if "`" in s:
+        s = s.replace("`", "'")
+    return f"`{s}`"
+
+
 class SlackClient:
     """Post messages and threads to Slack via the Web API."""
 
@@ -117,8 +130,18 @@ class SlackClient:
 
     def format_new_contact(self, contact: dict, org_id: int, date_str: str) -> str:
         role_field_key = PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY
-        email_display = f"{contact['email']} _({contact['email_confidence']} confidence)_" if contact.get("email") else "Not found"
-        phone_display = contact.get("phone") or "Not found"
+        if contact.get("email"):
+            email_display = (
+                f"{slack_plaintext_no_autolink(contact['email'])} "
+                f"_({contact.get('email_confidence', 'low')} confidence)_"
+            )
+        else:
+            email_display = "Not found"
+        phone_display = (
+            slack_plaintext_no_autolink(contact["phone"])
+            if contact.get("phone")
+            else "Not found"
+        )
 
         # Strip a recognised salutation from the name and map it to the
         # Pipedrive salutation custom field.

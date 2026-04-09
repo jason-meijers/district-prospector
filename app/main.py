@@ -19,7 +19,7 @@ from app.config import (
     ROLE_CATEGORY_OPTIONS,
 )
 from app.pipedrive import PipedriveClient
-from app.slack import SlackClient
+from app.slack import SlackClient, slack_plaintext_no_autolink
 from app.agent import ExtractionAgent
 from app.firecrawl_scraper import (
     discover_district_website,
@@ -309,12 +309,15 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         # Post email pattern info
         email_pattern = result.get("email_pattern", {})
         if email_pattern.get("pattern"):
+            raw_examples = email_pattern.get("examples_found", [])[:2]
+            examples_fmt = ", ".join(slack_plaintext_no_autolink(x) for x in raw_examples if x)
+            ex_line = f"Examples: {examples_fmt}\n" if examples_fmt else ""
             await slack.post_thread(
                 thread_ts,
                 f"📧 *Email Pattern Detected*\n"
                 f"Pattern: `{email_pattern['pattern']}`\n"
                 f"Confidence: {email_pattern.get('confidence', 'unknown')}\n"
-                f"Examples: {', '.join(email_pattern.get('examples_found', [])[:2])}"
+                f"{ex_line}".rstrip(),
             )
 
         # Post token usage as last thread message

@@ -18,7 +18,7 @@ from app.database import (
     run_dedup_job,
     reset_district_to_pending,
 )
-from app.slack import SlackClient
+from app.slack import SlackClient, slack_plaintext_no_autolink
 
 
 def _slack_district_org_link(
@@ -187,8 +187,8 @@ def _format_batch_contact_line(contact: dict) -> str:
     name = (contact.get("name") or "").strip() or "Unknown"
     role = (contact.get("job_title") or "").strip() or "Unknown role"
     role_category = contact.get("role_category") or contact.get("role_category_id") or "Unknown"
-    email = contact.get("email") or "N/A"
-    phone = contact.get("phone") or "N/A"
+    email = slack_plaintext_no_autolink(contact.get("email") or "N/A")
+    phone = slack_plaintext_no_autolink(contact.get("phone") or "N/A")
     source_url = (contact.get("source_url") or "").strip() or "N/A"
     return f"• {name} | {email} | {phone} | {role_category} | {role}\n  source: {source_url}"
 
