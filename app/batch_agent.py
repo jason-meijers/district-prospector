@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 import anthropic
 from app.config import get_settings
+from app.json_llm import parse_llm_json_object
 
 # ─────────────────────────────────────────────────────────────
 # Role options passed directly into the prompt so Claude
@@ -639,16 +640,9 @@ class BatchExtractionAgent:
                 "rationale": "triage_no_response",
             }, usage
 
-        parsed: dict | None = None
-        try:
-            cleaned = (
-                raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            )
-            parsed = json.loads(cleaned)
-            if not isinstance(parsed, dict):
-                parsed = None
-        except json.JSONDecodeError as e:
-            print(f"[batch_agent] Triage JSON parse error: {e}")
+        parsed = parse_llm_json_object(raw)
+        if parsed is None:
+            print("[batch_agent] Triage JSON parse error: could not parse JSON object")
             print(f"[batch_agent] Triage raw (first 400 chars): {raw[:400]}")
 
         cap = max(0, int(self.settings.batch_enrichment_url_cap))
@@ -697,11 +691,9 @@ class BatchExtractionAgent:
             print(f"[batch_agent] Claude returned no text for {org_name}")
             return [], {}, usage
 
-        try:
-            cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            result = json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            print(f"[batch_agent] JSON parse error for {org_name}: {e}")
+        result = parse_llm_json_object(raw)
+        if not result:
+            print(f"[batch_agent] JSON parse error for {org_name}: could not parse JSON object")
             print(f"[batch_agent] Raw response (first 500 chars): {raw[:500]}")
             return [], {}, usage
 
