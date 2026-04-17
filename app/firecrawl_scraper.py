@@ -1,12 +1,38 @@
 from __future__ import annotations
 import asyncio
 import json
+import re
 import time
 import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from app.config import get_settings
 from app.batch_agent import BatchExtractionAgent
+
+
+# Minimum number of "Name — Title" / "Name | Title | Email" style rows on
+# page 1 that indicates the directory is already dense enough; if we see this
+# many we skip pagination even when the URL looks directory-like.
+_INTERACT_ROW_DENSITY_THRESHOLD = 8
+
+# Regexes for detecting person-row density in markdown. The pipe pattern is
+# common on platforms that render directories as tables.
+_PERSON_ROW_EMDASH = re.compile(
+    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-zA-Z\-']+)+)\s*[—\-–]\s*([A-Z][A-Za-z/ &]+)"
+)
+_PERSON_ROW_PIPE = re.compile(
+    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-zA-Z\-']+)+)\s*\|\s*([A-Z][A-Za-z/ &]+)"
+)
+
+
+def _count_person_rows(markdown: str | None) -> int:
+    if not markdown:
+        return 0
+    sample = markdown[:40_000]
+    return (
+        len(_PERSON_ROW_EMDASH.findall(sample))
+        + len(_PERSON_ROW_PIPE.findall(sample))
+    )
 
 # Playwright (node) — paginate staff directories in one interact call; __MAX_PAGES__ substituted at runtime.
 _INTERACT_NODE_TEMPLATE = r"""
@@ -164,10 +190,20 @@ def _should_run_interact(
         return False
     n = len((markdown or "").strip())
     thin = n < int(settings.firecrawl_interact_min_markdown_chars)
-    # Triage-selected staff directory: always run interact so we paginate (e.g. superintendent
-    # on page 3). Page 1 alone is often "thick" markdown, which previously skipped interact.
+
+    # Even when triage marks this URL as interact_priority, skip pagination if
+    # page-1 markdown already shows a dense roster — paginating a page that
+    # already has everything wastes Firecrawl credits.
     if interact_priority:
+        rows = _count_person_rows(markdown)
+        if rows >= _INTERACT_ROW_DENSITY_THRESHOLD and not thin:
+            print(
+                f"[firecrawl] skipping interact for {url}: page-1 already has "
+                f"{rows} person-like rows (threshold={_INTERACT_ROW_DENSITY_THRESHOLD})"
+            )
+            return False
         return True
+
     if not _directory_like_url(url):
         return False
     return thin
@@ -257,6 +293,24 @@ _MAP_SEARCH_TERMS = (
     "staff directory leadership superintendent curriculum CTE "
     "administration department contact secondary high school"
 )
+
+
+async def _firecrawl_map_biased(app: object, base_url: str, limit: int) -> object:
+    """
+    Thin wrapper around ``app.map`` that biases discovery toward staff/
+    leadership pages via the ``search`` parameter. Some SDK builds don't
+    expose ``search`` yet; fall back silently so the pipeline keeps working.
+    """
+    try:
+        return await app.map(url=base_url, limit=limit, search=_MAP_SEARCH_TERMS)  # type: ignore[call-arg]
+    except TypeError as e:
+        if "search" in str(e):
+            print(
+                f"[firecrawl] map() in this SDK build does not accept search=; "
+                f"falling back without bias ({e})"
+            )
+            return await app.map(url=base_url, limit=limit)
+        raise
 
 # URL path segments that strongly suggest the page won't contain target
 # contacts — used as a post-filter on map results.
@@ -469,7 +523,7 @@ async def discover_map_candidates(
     cap = max(10, min(int(settings.batch_triage_max_candidates), 80))
 
     try:
-        result = await app.map(url=base_url, limit=fetch_limit)
+        result = await _firecrawl_map_biased(app, base_url, fetch_limit)
         if usage is not None:
             usage["map_calls"] = int(usage.get("map_calls") or 0) + 1
 
@@ -481,8 +535,9 @@ async def discover_map_candidates(
                 continue
             if any(u.lower().endswith(ext) for ext in _EXCLUDED_EXTENSIONS):
                 continue
-            if _score_url(u) < -3:
-                continue
+            # Pre-triage heuristic filter is intentionally removed: we now let
+            # the triage LLM inspect title/description on borderline URLs it
+            # might otherwise have dropped (Phase 1.2).
             filtered.append(row)
 
         filtered.sort(key=lambda r: (-_score_url(r["url"]), len(urlparse(r["url"]).path)))
@@ -598,7 +653,7 @@ async def discover_urls(
     app = _get_async_firecrawl()
 
     try:
-        result = await app.map(url=base_url, limit=fetch_limit)
+        result = await _firecrawl_map_biased(app, base_url, fetch_limit)
         if usage is not None:
             usage["map_calls"] = int(usage.get("map_calls") or 0) + 1
 
@@ -759,28 +814,155 @@ async def scrape_page(
         return None
 
 
+async def _batch_scrape_markdowns(
+    urls: list[str],
+    usage: dict | None,
+) -> dict[str, str]:
+    """
+    Firecrawl batch_scrape wrapper — returns {url: markdown} for whatever
+    succeeded. URLs that fail or come back thin are simply omitted so the
+    caller can retry them individually via :func:`scrape_page`.
+
+    Falls back to parallel single scrapes if the SDK/account doesn't expose
+    batch_scrape (older SDKs) so rollout is safe.
+    """
+    if not urls:
+        return {}
+
+    settings = get_settings()
+    app = _get_async_firecrawl()
+    timeout_ms = max(1_000, min(int(settings.firecrawl_scrape_timeout_ms), 300_000))
+    wait_ms = max(0, int(settings.firecrawl_scrape_wait_for_ms))
+
+    batch_fn = getattr(app, "batch_scrape", None)
+    if not callable(batch_fn):
+        # Older SDKs just don't have this; caller will hit the per-URL path.
+        return {}
+
+    kwargs: dict = {
+        "urls": list(urls),
+        "formats": ["markdown"],
+        "timeout": timeout_ms,
+    }
+    if wait_ms > 0:
+        kwargs["wait_for"] = wait_ms
+
+    try:
+        result = await batch_fn(**kwargs)
+    except TypeError as e:
+        # Some SDK builds want positional urls, or don't accept wait_for here.
+        retry_kwargs = {k: v for k, v in kwargs.items() if k != "wait_for"}
+        try:
+            result = await batch_fn(**retry_kwargs)
+        except Exception as inner:
+            print(f"[firecrawl] batch_scrape unusable ({type(e).__name__}: {e}; retry: {inner})")
+            return {}
+    except Exception as e:
+        print(f"[firecrawl] batch_scrape failed ({type(e).__name__}: {e}); will retry per-URL")
+        return {}
+
+    if usage is not None:
+        usage["scrape_calls"] = int(usage.get("scrape_calls") or 0) + len(urls)
+
+    docs = []
+    if isinstance(result, dict):
+        docs = result.get("data") or result.get("documents") or []
+    else:
+        for attr in ("data", "documents", "results"):
+            candidate = getattr(result, attr, None)
+            if isinstance(candidate, list):
+                docs = candidate
+                break
+        if not docs and isinstance(result, list):
+            docs = result
+
+    out: dict[str, str] = {}
+    for doc in docs:
+        md = _extract_markdown(doc)
+        if not md or len(md.strip()) < 50:
+            continue
+        doc_url: str | None = None
+        meta = getattr(doc, "metadata", None)
+        if isinstance(meta, dict):
+            doc_url = meta.get("source_url") or meta.get("url")
+        elif meta is not None:
+            doc_url = getattr(meta, "source_url", None) or getattr(meta, "url", None)
+        if not doc_url and isinstance(doc, dict):
+            doc_url = doc.get("url") or doc.get("source_url")
+        if not doc_url:
+            continue
+        out[str(doc_url)] = md
+        _add_scrape_credits_from_document(usage or {}, doc)
+
+    if out:
+        print(f"[firecrawl] batch_scrape returned {len(out)}/{len(urls)} pages")
+    return out
+
+
+async def _scrape_many(
+    url_flag_pairs: list[tuple[str, bool]],
+    usage: dict | None,
+) -> list[dict]:
+    """
+    Shared implementation for :func:`scrape_pages` and
+    :func:`scrape_pages_with_interact_flags`. Uses Firecrawl's batch_scrape
+    for URLs that don't need interact-based pagination, and falls back to
+    per-URL :func:`scrape_page` for interact-priority URLs and anything the
+    batch pass missed.
+    """
+    if not url_flag_pairs:
+        return []
+
+    batch_urls = [u for u, flag in url_flag_pairs if not flag]
+    # De-duplicate while preserving order; batch_scrape doesn't deduplicate.
+    seen_batch: set[str] = set()
+    deduped_batch: list[str] = []
+    for u in batch_urls:
+        if u in seen_batch:
+            continue
+        seen_batch.add(u)
+        deduped_batch.append(u)
+
+    batch_results = await _batch_scrape_markdowns(deduped_batch, usage)
+
+    # Anything that wasn't covered by the batch response (or needs interact)
+    # drops to per-URL scrape_page so retries/fallback/interact still work.
+    pages: list[dict] = []
+    followup_tasks: list[tuple[str, bool]] = []
+    for url, flag in url_flag_pairs:
+        if flag:
+            followup_tasks.append((url, True))
+            continue
+        md = batch_results.get(url)
+        if md and len(md) > 30:
+            pages.append({"url": url, "content": md})
+        else:
+            followup_tasks.append((url, False))
+
+    if followup_tasks:
+        tasks = [scrape_page(u, usage, interact_priority=flag) for u, flag in followup_tasks]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        dropped_short = 0
+        for (url, _), content in zip(followup_tasks, results):
+            if isinstance(content, Exception):
+                print(f"[firecrawl] scrape error for {url}: {content}")
+                continue
+            if content and len(content) > 30:
+                pages.append({"url": url, "content": content})
+            elif content:
+                dropped_short += 1
+        if dropped_short:
+            print(f"[firecrawl] dropped {dropped_short} short pages (<31 chars)")
+    return pages
+
+
 async def scrape_pages(urls: list[str], usage: dict | None = None) -> list[dict]:
     """
-    Scrape multiple pages in parallel.
-    Returns list of {"url": str, "content": str} for pages that succeeded.
+    Scrape multiple pages. Uses Firecrawl's batch_scrape when available for
+    cost savings, falling back to parallel single scrapes otherwise. Returns
+    list of {"url": str, "content": str} for pages that succeeded.
     """
-    import asyncio
-    tasks = [scrape_page(url, usage, interact_priority=False) for url in urls]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    pages = []
-    dropped_short = 0
-    for url, content in zip(urls, results):
-        if isinstance(content, Exception):
-            print(f"[firecrawl] scrape error for {url}: {content}")
-            continue
-        if content and len(content) > 30:
-            pages.append({"url": url, "content": content})
-        elif content:
-            dropped_short += 1
-    if dropped_short:
-        print(f"[firecrawl] dropped {dropped_short} short pages (<31 chars)")
-    return pages
+    return await _scrape_many([(u, False) for u in urls], usage)
 
 
 async def scrape_pages_with_interact_flags(
@@ -788,20 +970,7 @@ async def scrape_pages_with_interact_flags(
     usage: dict | None = None,
 ) -> list[dict]:
     """Parallel scrape with per-URL interact_priority (for directory-first path)."""
-    import asyncio
-    tasks = [
-        scrape_page(url, usage, interact_priority=flag)
-        for url, flag in url_flag_pairs
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    pages: list[dict] = []
-    for (url, _), content in zip(url_flag_pairs, results):
-        if isinstance(content, Exception):
-            print(f"[firecrawl] scrape error for {url}: {content}")
-            continue
-        if content and len(content) > 30:
-            pages.append({"url": url, "content": content})
-    return pages
+    return await _scrape_many(url_flag_pairs, usage)
 
 
 def _url_triage_plan_usable(plan: dict) -> bool:
@@ -1188,6 +1357,51 @@ async def scrape_district(
     print(f"[firecrawl] Starting scrape for {base_url}")
 
     triage_meta: dict | None = None
+
+    # ── Platform adapter fast-path ────────────────────────────────
+    # If a known CMS is detected (e.g. SchoolInsites) and its adapter returns
+    # real pages, we can skip Firecrawl+LLM entirely. Detection is cheap —
+    # one static HTML fetch plus regex fingerprints.
+    platform_pages: list[dict] = []
+    platform_meta: dict | None = None
+    if bool(settings.platform_adapters_enabled):
+        try:
+            from app.platforms import detect_platform, fetch_with_adapter
+            adapter_html = await _fetch_html(base_url)
+            if adapter_html:
+                detection = await detect_platform(adapter_html, base_url)
+                if detection is not None:
+                    adapter_pages = await fetch_with_adapter(
+                        base_url, detection, usage=fc_usage
+                    )
+                    platform_meta = {
+                        "platform": detection.name,
+                        "confidence": round(detection.confidence, 3),
+                        "pages_returned": len(adapter_pages),
+                    }
+                    print(
+                        f"[firecrawl] platform adapter hit: {detection.name} "
+                        f"(confidence={detection.confidence:.2f}, "
+                        f"pages={len(adapter_pages)})"
+                    )
+                    platform_pages = [
+                        {"url": p.url, "content": p.content} for p in adapter_pages
+                    ]
+        except Exception as e:
+            print(f"[firecrawl] platform adapter dispatch failed: {type(e).__name__}: {e}")
+
+    if platform_pages:
+        triage_meta = {
+            "used_heuristic": False,
+            "used_platform_adapter": True,
+            "platform": platform_meta,
+            "staff_directory_url": None,
+            "enrichment_urls": [],
+            "include_homepage": False,
+            "rationale": f"platform adapter: {platform_meta['platform']}",
+            "triage_usage": {},
+        }
+        return platform_pages, fc_usage, triage_meta
 
     def _fill_triage_tokens(meta: dict | None) -> None:
         if not meta:

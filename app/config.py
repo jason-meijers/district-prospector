@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Literal
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -151,6 +152,35 @@ class Settings(BaseSettings):
 
     # Google Sheets ID for EOD review export (optional)
     google_sheet_id: str | None = None
+
+    # ── Contact Hunter (LLM tool-calling agent loop) ────────────
+    # off         — skip agent entirely (legacy pipeline only)
+    # gap_fill    — run pipeline first, invoke agent only when target roles are missing (default)
+    # full        — skip pipeline, let the agent run the whole research end-to-end
+    contact_hunter_mode: Literal["off", "gap_fill", "full"] = "gap_fill"
+    hunter_max_tool_calls_gap_fill: int = 8
+    hunter_max_tool_calls_full: int = 15
+    hunter_max_output_tokens: int = 60_000
+    hunter_max_seconds: int = 180
+    hunter_model: str = "claude-sonnet-4-20250514"
+
+    # ── Platform adapters ───────────────────────────────────────
+    # When an adapter reports a detection score ≥ this threshold, its
+    # contacts are used directly and Firecrawl/LLM extraction is skipped.
+    platform_adapter_min_confidence: float = 0.75
+    platform_adapters_enabled: bool = True
+
+    # ── Slack interactivity (Block Kit action buttons) ──────────
+    # Shared secret used to verify Slack request signatures on
+    # POST /slack/interact. Required when slack_use_block_kit=true.
+    slack_signing_secret: str | None = None
+    # Feature flag: post Block Kit messages with interactive buttons
+    # (stores full Pipedrive payloads in pending_actions) instead of the
+    # legacy emoji + ---Payload--- text format parsed by Zapier.
+    slack_use_block_kit: bool = False
+    # Base URL this service is reachable at; used to log a reminder of
+    # the Slack App "Interactivity request URL" that should be configured.
+    public_base_url: str | None = None
 
     class Config:
         env_file = ".env"

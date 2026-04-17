@@ -438,6 +438,115 @@ def _backfill_emails_from_pattern(contacts: list[dict], email_pattern: dict) -> 
     return filled
 
 
+# ─────────────────────────────────────────────────────────────
+# Per-page-type adaptive character budgets
+# ─────────────────────────────────────────────────────────────
+
+# URL path segments that signal a staff directory / leadership page and
+# justify spending more characters on that page's content.
+_DIRECTORY_HINT_SEGMENTS = (
+    "staff", "directory", "leadership", "administration",
+    "cabinet", "superintendent", "departments", "department",
+    "curriculum", "cte", "career-tech",
+)
+
+
+def _classify_page_type(url: str, content: str, website_url: str | None) -> str:
+    """
+    Classify a scraped page so :func:`extract_contacts_raw` can allocate the
+    right character budget to it. Returns one of:
+      ``"platform_api"`` — full text, no truncation
+      ``"directory"``    — big chunk (~30k chars)
+      ``"homepage"``     — trimmed (~3k chars)
+      ``"enrichment"``   — medium trim (~6k chars)
+    """
+    u = (url or "").strip()
+    lower_url = u.lower()
+
+    if "[schoolinsites api]" in lower_url or "[platform api]" in lower_url:
+        return "platform_api"
+
+    if website_url:
+        base = website_url.rstrip("/")
+        stripped_url = u.split(" [", 1)[0].rstrip("/")
+        if stripped_url == base:
+            return "homepage"
+
+    if any(seg in lower_url for seg in _DIRECTORY_HINT_SEGMENTS):
+        return "directory"
+
+    # Tall pages with many "Name — Title" rows are almost always staff
+    # directories even if the URL doesn't name them as such.
+    if content:
+        sample = content[:20_000]
+        hits = len(re.findall(r"\b[A-Z][a-z]+\s+[A-Z][a-zA-Z\-']+\s*[—-]\s*[A-Z][A-Za-z/ ]+", sample))
+        if hits >= 8:
+            return "directory"
+
+    return "enrichment"
+
+
+def _budget_for_page_type(page_type: str, default_chars: int) -> int | None:
+    """
+    Return the char cap for a page. ``None`` means "no truncation".
+    ``default_chars`` is the legacy uniform cap — used as a floor for
+    directory/homepage so we never shrink below the old behaviour unless
+    explicitly configured lower.
+    """
+    if page_type == "platform_api":
+        return None
+    if page_type == "directory":
+        return max(default_chars, 30_000)
+    if page_type == "homepage":
+        return min(default_chars, 3_000)
+    return min(default_chars, 6_000)
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    """Split page content into paragraphs using blank-line boundaries."""
+    if not text:
+        return []
+    return [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+
+
+def _dedup_paragraphs_across_pages(pages: list[dict]) -> list[dict]:
+    """
+    Drop paragraphs that repeat across pages (nav blocks, site-wide footers,
+    "quick links" menus) before sending content to Claude. Keeps the first
+    occurrence so the page that originally surfaced a paragraph retains it.
+    """
+    if not pages:
+        return pages
+
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    dropped = 0
+    for page in pages:
+        content = page.get("content") or ""
+        paragraphs = _split_paragraphs(content)
+        if not paragraphs:
+            deduped.append(dict(page))
+            continue
+        kept: list[str] = []
+        for para in paragraphs:
+            # Skip very short fragments — they're more likely to be false
+            # positives (dates, button labels) than reusable boilerplate.
+            if len(para) < 60:
+                kept.append(para)
+                continue
+            key = re.sub(r"\s+", " ", para.lower())[:240]
+            if key in seen:
+                dropped += 1
+                continue
+            seen.add(key)
+            kept.append(para)
+        deduped.append({**page, "content": "\n\n".join(kept)})
+
+    if dropped:
+        print(f"[batch_agent] Dropped {dropped} duplicate paragraph(s) across pages")
+    return deduped
+
+
 def _normalize_all_contact_phones(contacts: list[dict]) -> None:
     for c in contacts:
         raw = c.get("phone")
@@ -671,11 +780,27 @@ class BatchExtractionAgent:
         if not pages:
             return [], {}, {}
 
-        chars_per_page = self.settings.batch_chars_per_page
-        page_sections = []
-        for i, page in enumerate(pages, 1):
-            content = (page.get("content") or "")[:chars_per_page]
-            page_sections.append(f"### Page {i}: {page['url']}\n{content}")
+        default_chars = self.settings.batch_chars_per_page
+        deduped_pages = _dedup_paragraphs_across_pages(pages)
+
+        page_sections: list[str] = []
+        total_chars = 0
+        budget_log: list[str] = []
+        for i, page in enumerate(deduped_pages, 1):
+            url = page.get("url") or ""
+            content = page.get("content") or ""
+            page_type = _classify_page_type(url, content, website_url)
+            cap = _budget_for_page_type(page_type, default_chars)
+            trimmed = content if cap is None else content[:cap]
+            total_chars += len(trimmed)
+            budget_log.append(f"{page_type}:{len(trimmed)}")
+            page_sections.append(f"### Page {i}: {url}\n{trimmed}")
+
+        print(
+            f"[batch_agent] page budgets for {org_name}: "
+            + ", ".join(budget_log)
+            + f" (total={total_chars} chars)"
+        )
 
         pages_text = "\n\n".join(page_sections)
         user_message = (

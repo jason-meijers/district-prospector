@@ -1,14 +1,35 @@
-# Slack Output Format & Zapier Parsing Spec
+# Slack Output Format (Block Kit)
+
+All actions now post as Slack Block Kit messages with interactive buttons
+that call this service directly. The legacy emoji + `---PAYLOAD---` format
+parsed by Zapier is deprecated (see the "Legacy Zapier flow" section at the
+bottom for migration notes).
 
 ## Slack Channel
 
-All messages go to a single channel, e.g., `#district-research`
+All messages go to a single channel, e.g., `#district-research`.
 
----
+## Architecture Overview
 
-## Parent Message Format
+```
+Pipeline → Supabase.pending_actions  (row with full Pipedrive payload)
+        ↓
+        → Slack.chat.postMessage (Block Kit with Approve / Edit / Skip buttons)
+        ↓
+User clicks button
+        ↓
+Slack → POST /slack/interact  (payload contains action_id only, not the body)
+        ↓
+verify signing secret → claim pending_actions row → call Pipedrive →
+response_url updates the original Slack message with ✅ / ❌ / ⏭️
+```
 
-Posted to the channel when research completes for a district.
+The important property: **the Pipedrive payload never appears in the Slack
+message**. Slack only carries an opaque `pending_action_<id>` action_id.
+Auditing goes through Supabase (`pending_actions` table) which records the
+full request body, result, and timestamps.
+
+## Parent Message Format (unchanged)
 
 ```
 ✅ *Research complete for {district_name}*
@@ -20,164 +41,66 @@ Posted to the channel when research completes for a district.
 • {updated_count} need updates
 • {new_count} new contacts found
 • {missing_count} not found on site
-
-React with ✅ on any threaded action to approve it.
 ```
 
----
+## Thread Messages (Block Kit)
 
-## Thread Message Formats
+Each actionable contact posts as a threaded Block Kit message built by
+`app/slack_blocks.py`:
 
-All action messages are posted as replies to the parent message.
-Each actionable message contains a `---PAYLOAD---` delimiter.
-The Zap parses everything BELOW that delimiter as JSON.
+- **NEW contact** — "Create" button (primary), "Skip" button.
+- **UPDATED contact** — "Apply update" button, "Skip" button.
+- **MISSING contact (mark former)** — "Mark as Former", "Leave as-is" button.
+- **CONFIRMED contact** — plain text (no buttons, nothing to approve).
 
-### NEW Contact
+Each button's `action_id` is `pending_action_<uuid>` (approve) or
+`pending_action_skip` (cancel). Slack sends that id to `/slack/interact`
+which looks up the row in `pending_actions` to get the actual Pipedrive
+payload.
 
-```
-🆕 *CREATE: {name}*
-📋 Title: {job_title}
-🏷️ Role Category: {role_category}
-📧 Email: {email} _({email_confidence} confidence)_
-📞 Phone: {phone}
-📄 Source: {source_page_url}
-📝 {notes}
+## Configuration
 
----PAYLOAD---
-{
-  "action": "create_person",
-  "org_id": {org_id},
-  "data": {
-    "name": "{name}",
-    "org_id": {org_id},
-    "email": [{"value": "{email}", "primary": true, "label": "work"}],
-    "phone": [{"value": "{phone}", "primary": true, "label": "work"}],
-    "job_title": "{job_title}",
-    "{role_category_field_key}": "{role_category}"
-  },
-  "note": "Source: {source_page_url}\nEmail confidence: {email_confidence}\nAgent notes: {notes}\nResearched: {date}"
-}
-```
+Required environment variables:
 
-### UPDATED Contact
+| Variable | Purpose |
+|----------|---------|
+| `SLACK_BOT_TOKEN` | Posts messages (existing) |
+| `SLACK_CHANNEL_ID` | Target channel (existing) |
+| `SLACK_SIGNING_SECRET` | Validates `/slack/interact` requests |
+| `SLACK_USE_BLOCK_KIT` | Set `true` to enable Block Kit output |
+| `PUBLIC_BASE_URL` | For documentation/logging of the interactivity URL |
 
-```
-✏️ *UPDATE: {name}* (ID: {person_id})
-📋 Changes:
-  • {field}: {old_value} → {new_value}
-📄 Source: {source_page_url}
-📝 {notes}
+### Slack App Interactivity
 
----PAYLOAD---
-{
-  "action": "update_person",
-  "person_id": {person_id},
-  "data": {
-    "{changed_field}": "{new_value}"
-  },
-  "note": "Updated by research agent on {date}.\nChange: {field} from '{old_value}' to '{new_value}'.\nSource: {source_page_url}"
-}
-```
+In the Slack app's **Interactivity & Shortcuts** page:
 
-### CONFIRMED Contact (informational — no payload)
+1. Toggle **Interactivity** on.
+2. Set **Request URL** to `https://<PUBLIC_BASE_URL>/slack/interact`.
+3. Reinstall the app so the signing secret is in use.
 
-```
-✅ *CONFIRMED: {name}*
-📋 Title: {job_title}
-📄 Still listed on: {source_page_url}
-_No action needed — contact verified on current site._
-```
+Slack sends the request as `application/x-www-form-urlencoded` with a
+`payload` field containing JSON. `POST /slack/interact` handles all of that
+(see `app/slack_interact.py`).
 
-No `---PAYLOAD---` section. No emoji reaction needed.
+## Observability
 
-### MISSING Contact
+- `pending_actions` table stores the full action lifecycle: `pending`,
+  `executed`, `failed`, `cancelled`, with the Pipedrive request body and
+  response.
+- The Slack message is updated in place via `response_url` so approvers see
+  the outcome without scrolling through replies.
 
-```
-⚠️ *NOT FOUND: {name}* (ID: {person_id})
-📋 Last known title: {job_title}
-📝 Not found on current district website. This could mean they've moved on, or the site structure changed. Recommend manual verification before making changes.
+## Legacy Zapier Flow (deprecated)
 
----PAYLOAD---
-{
-  "action": "add_note",
-  "person_id": {person_id},
-  "note": "Research agent ({date}): This contact was not found on the district website ({website_url}). They may have left the district or the site may have been restructured. Manual verification recommended."
-}
-```
+Before Block Kit, each thread message embedded a `---PAYLOAD---` block and
+Zapier watched for ✅ reactions to execute the JSON payload. That flow is
+fully retained inside `app/slack.py::SlackClient.format_*` as a fallback
+when `SLACK_USE_BLOCK_KIT=false`, but should be disabled once the Block Kit
+path is verified:
 
----
-
-## Zapier Workflow Spec
-
-### Trigger
-- **App**: Slack
-- **Event**: New Reaction Added
-- **Channel**: `#district-research`
-- **Reaction**: `white_check_mark` (✅) or your chosen emoji
-
-### Step 1: Get Message Text
-- Use Slack → "Find Message" using the message timestamp from the trigger
-
-### Step 2: Extract Payload
-- Code by Zapier (JavaScript):
-
-```javascript
-const message = inputData.message_text;
-const delimiter = '---PAYLOAD---';
-const payloadIndex = message.indexOf(delimiter);
-
-if (payloadIndex === -1) {
-  return { skip: true, reason: 'No payload found' };
-}
-
-const jsonString = message.substring(payloadIndex + delimiter.length).trim();
-const payload = JSON.parse(jsonString);
-
-return {
-  skip: false,
-  action: payload.action,
-  person_id: payload.person_id || null,
-  org_id: payload.org_id || null,
-  data: JSON.stringify(payload.data || {}),
-  note: payload.note || null
-};
-```
-
-### Step 3: Router (Paths by action)
-
-**Path A: `create_person`**
-1. Pipedrive → Create Person (use parsed `data` fields)
-2. Pipedrive → Create Note (use `note` field, link to new person ID)
-3. Slack → Add Reaction (🎉 to confirm execution)
-
-**Path B: `update_person`**
-1. Pipedrive → Update Person (ID from `person_id`, fields from `data`)
-2. Pipedrive → Create Note (use `note` field, link to person ID)
-3. Slack → Add Reaction (🎉)
-
-**Path C: `add_note`**
-1. Pipedrive → Create Note (use `note` field, link to `person_id`)
-2. Slack → Add Reaction (🎉)
-
-### Edge Cases
-- If payload JSON is malformed → Zap error handler sends DM to admin
-- If Pipedrive API returns 404 (person deleted) → Log error, add ❌ reaction
-- If duplicate detected (person already exists) → Zap should search Pipedrive first; if found, skip create and add 🔄 reaction
-
----
-
-## Preventing Duplicate Approvals
-
-Add a check at the start of the Zap: if the message already has a 🎉 reaction, skip execution. This prevents double-processing if someone accidentally reacts twice.
-
----
-
-## Field Key Reference
-
-Before deploying, replace these placeholders with actual Pipedrive field keys:
-
-| Placeholder | Description | How to Find |
-|-------------|-------------|-------------|
-| `{role_category_field_key}` | Custom field key for "Role Category" on Person | Pipedrive → Settings → Data Fields → Person → find key (format: `abc123...`) |
-| `{org_id}` | Populated at runtime from the triggering webhook | Comes from Step 2 of agent flow |
-| `{person_id}` | Populated at runtime from existing CRM data | Comes from Pipedrive GET /organizations/{id}/persons |
+1. Set `SLACK_USE_BLOCK_KIT=true`.
+2. Run one batch end-to-end and confirm buttons work.
+3. Turn off the Zapier Zaps that parse `---PAYLOAD---` so contacts aren't
+   double-created.
+4. Remove the legacy formatter methods from `app/slack.py` once no traffic
+   has hit them for a full batch.

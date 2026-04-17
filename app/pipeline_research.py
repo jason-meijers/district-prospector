@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import uuid
 from contextlib import contextmanager
 from typing import Any
 
 from app.batch_agent import BatchExtractionAgent
 from app.config import ROLE_CATEGORY_OPTIONS, get_settings
 from app.firecrawl_scraper import scrape_district
+from app.role_coverage import cohort_labels, score_role_coverage
 
 
 def _norm_name(name: str | None) -> str:
@@ -194,6 +196,79 @@ def _pipedrive_max_lead_overrides() -> Any:
             setattr(settings, k, v)
 
 
+async def _run_contact_hunter_gap_fill(
+    *,
+    org_name: str,
+    website_url: str,
+    district_state: str | None,
+    district_id: str | None,
+    extracted: list[dict[str, Any]],
+    firecrawl_usage: dict,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Hybrid mode: after the pipeline extraction, check which target role
+    cohorts are still missing and let :class:`ContactHunter` take another
+    pass at filling them. Returns (hunter_contacts, hunter_meta).
+    """
+    # Import lazily so the pipeline module doesn't pull anthropic on cold paths.
+    from app.contact_hunter import Budget, ContactHunter, HuntGoal
+    from app.database import persist_hunter_trace
+    from app.hunter_tools import build_default_tool_impls
+
+    coverage = score_role_coverage(extracted)
+    if not coverage.has_gaps:
+        return [], {"skipped": True, "reason": "no gaps"}
+
+    labels = cohort_labels()
+    missing_labels = [labels.get(m, m) for m in sorted(coverage.missing)]
+    print(
+        f"[pipeline_research] coverage gap for {org_name}: missing {missing_labels}; "
+        "running ContactHunter gap-fill"
+    )
+
+    settings = get_settings()
+    goal = HuntGoal(
+        district_name=org_name,
+        district_state=district_state,
+        base_url=website_url,
+        missing_roles=missing_labels,
+        known_contacts=extracted,
+    )
+    budget = Budget(
+        max_tool_calls=int(settings.hunter_max_tool_calls_gap_fill),
+        max_output_tokens=int(settings.hunter_max_output_tokens),
+        max_seconds=float(settings.hunter_max_seconds),
+    )
+    tools = build_default_tool_impls(website_url, usage=firecrawl_usage)
+
+    hunter = ContactHunter(goal=goal, tool_impls=tools, budget=budget)
+    result = await hunter.run()
+
+    hunt_id = str(uuid.uuid4())
+    persist_hunter_trace(
+        hunt_id=hunt_id,
+        trace=result.trace,
+        district_id=district_id,
+        district_name=org_name,
+    )
+
+    print(
+        f"[pipeline_research] ContactHunter {hunt_id} finished: "
+        f"contacts={len(result.contacts)}, tool_calls={result.tool_calls}, "
+        f"stop={result.stop_reason}, elapsed={result.elapsed_seconds:.1f}s"
+    )
+
+    meta = {
+        "hunt_id": hunt_id,
+        "stop_reason": result.stop_reason,
+        "tool_calls": result.tool_calls,
+        "elapsed_seconds": round(result.elapsed_seconds, 2),
+        "token_usage": result.token_usage,
+        "missing_before": sorted(coverage.missing),
+    }
+    return result.contacts, meta
+
+
 async def run_firecrawl_research(
     *,
     org_name: str,
@@ -201,10 +276,34 @@ async def run_firecrawl_research(
     existing_contacts: list[dict[str, Any]],
     all_person_names: dict[str, int] | None,
     district_state: str | None = None,
+    district_id: str | None = None,
+    research_mode: str | None = None,
 ) -> dict[str, Any]:
     """
     Shared Pipedrive research pipeline using Firecrawl + batch extraction.
+
+    ``research_mode`` controls strategy:
+      * ``pipeline`` (default) — fixed pipeline only.
+      * ``hybrid`` — run pipeline, then ContactHunter to fill coverage gaps.
+      * ``full_agent`` — skip the pipeline and hand the task to ContactHunter.
     """
+    settings = get_settings()
+    mode = (research_mode or settings.contact_hunter_mode or "pipeline").lower()
+    if mode not in ("pipeline", "hybrid", "full_agent"):
+        mode = "pipeline"
+
+    hunter_meta: dict[str, Any] | None = None
+
+    if mode == "full_agent":
+        return await _run_full_agent_research(
+            org_name=org_name,
+            website_url=website_url,
+            existing_contacts=existing_contacts,
+            all_person_names=all_person_names,
+            district_state=district_state,
+            district_id=district_id,
+        )
+
     extractor = BatchExtractionAgent()
     with _pipedrive_max_lead_overrides():
         pages, firecrawl_usage, url_triage = await scrape_district(
@@ -221,6 +320,18 @@ async def run_firecrawl_research(
     if not pages:
         return {"error": f"No readable pages found on {website_url}"}
 
+    if mode == "hybrid":
+        hunter_contacts, hunter_meta = await _run_contact_hunter_gap_fill(
+            org_name=org_name,
+            website_url=website_url,
+            district_state=district_state,
+            district_id=district_id,
+            extracted=extracted,
+            firecrawl_usage=firecrawl_usage,
+        )
+        if hunter_contacts:
+            extracted = extracted + _normalize_hunter_contacts(hunter_contacts)
+
     reconciled = reconcile_extracted_contacts(
         extracted_contacts=extracted,
         existing_contacts=existing_contacts,
@@ -230,6 +341,7 @@ async def run_firecrawl_research(
     return {
         "district_name": org_name,
         "website": website_url,
+        "research_mode": mode,
         "email_pattern": email_pattern or {},
         "contacts": reconciled,
         "research_notes": (
@@ -243,4 +355,117 @@ async def run_firecrawl_research(
         "usage": usage or {},
         "firecrawl_usage": firecrawl_usage or {},
         "url_triage": url_triage or {},
+        "hunter": hunter_meta or {},
+    }
+
+
+def _normalize_hunter_contacts(
+    hunter_contacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Coerce ContactHunter output into the dict shape the reconciler expects.
+
+    Hunter produces ``role_category`` string labels; map them back to the
+    Pipedrive role id when we can.
+    """
+    label_to_id = {label.strip().lower(): rid for rid, label in ROLE_CATEGORY_OPTIONS.items()}
+    out: list[dict[str, Any]] = []
+    for c in hunter_contacts:
+        label = (c.get("role_category") or "").strip()
+        rid = label_to_id.get(label.lower())
+        out.append(
+            {
+                "name": c.get("name") or "",
+                "job_title": c.get("title") or "",
+                "email": c.get("email"),
+                "email_confidence": "medium" if c.get("email") else "low",
+                "phone": c.get("phone"),
+                "role_category": label or None,
+                "role_category_id": rid,
+                "source_url": c.get("source_url"),
+                "notes": (c.get("evidence") or "")[:500],
+            }
+        )
+    return out
+
+
+async def _run_full_agent_research(
+    *,
+    org_name: str,
+    website_url: str,
+    existing_contacts: list[dict[str, Any]],
+    all_person_names: dict[str, int] | None,
+    district_state: str | None,
+    district_id: str | None,
+) -> dict[str, Any]:
+    """
+    Replace the pipeline entirely with a ContactHunter run. Intended for
+    districts that consistently lose the pipeline's heuristic game.
+    """
+    from app.contact_hunter import Budget, ContactHunter, HuntGoal
+    from app.database import persist_hunter_trace
+    from app.firecrawl_scraper import new_firecrawl_usage
+    from app.hunter_tools import build_default_tool_impls
+
+    settings = get_settings()
+    labels = cohort_labels()
+    all_missing = list(labels.values())
+
+    firecrawl_usage = new_firecrawl_usage()
+    goal = HuntGoal(
+        district_name=org_name,
+        district_state=district_state,
+        base_url=website_url,
+        missing_roles=all_missing,
+        known_contacts=[],
+    )
+    budget = Budget(
+        max_tool_calls=int(settings.hunter_max_tool_calls_full),
+        max_output_tokens=int(settings.hunter_max_output_tokens),
+        max_seconds=float(settings.hunter_max_seconds),
+    )
+    tools = build_default_tool_impls(website_url, usage=firecrawl_usage)
+
+    hunter = ContactHunter(goal=goal, tool_impls=tools, budget=budget)
+    result = await hunter.run()
+
+    hunt_id = str(uuid.uuid4())
+    persist_hunter_trace(
+        hunt_id=hunt_id,
+        trace=result.trace,
+        district_id=district_id,
+        district_name=org_name,
+    )
+
+    extracted = _normalize_hunter_contacts(result.contacts)
+    reconciled = reconcile_extracted_contacts(
+        extracted_contacts=extracted,
+        existing_contacts=existing_contacts,
+        all_person_names=all_person_names,
+    )
+
+    return {
+        "district_name": org_name,
+        "website": website_url,
+        "research_mode": "full_agent",
+        "email_pattern": {},
+        "contacts": reconciled,
+        "research_notes": (
+            f"Full-agent run: {result.tool_calls} tool calls, "
+            f"stop={result.stop_reason}, {len(extracted)} contacts found."
+        ),
+        "usage": {},
+        "firecrawl_usage": firecrawl_usage,
+        "url_triage": {
+            "used_heuristic": False,
+            "used_full_agent": True,
+            "rationale": "full_agent mode — pipeline bypassed",
+        },
+        "hunter": {
+            "hunt_id": hunt_id,
+            "stop_reason": result.stop_reason,
+            "tool_calls": result.tool_calls,
+            "elapsed_seconds": round(result.elapsed_seconds, 2),
+            "token_usage": result.token_usage,
+        },
     }

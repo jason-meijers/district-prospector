@@ -225,28 +225,94 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         # Small delay between thread messages to maintain order
         delay = 0.5
 
-        # Post confirmed contacts
+        use_blocks = bool(settings.slack_use_block_kit)
+        district_label = org_name
+        channel_id = settings.slack_channel_id
+
+        # Post confirmed contacts — no action required, text only works fine.
         for contact in confirmed:
             msg = slack.format_confirmed_contact(contact)
             await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
-        # Post updated contacts (person payload + note in same message)
+        # Post updated contacts
         for contact in updated:
-            msg = slack.format_updated_contact(contact, date_str)
-            await slack.post_thread(thread_ts, msg)
+            if use_blocks and contact.get("pipedrive_person_id"):
+                try:
+                    from app.database import attach_slack_message_to_action
+                    from app.slack_blocks import build_update_person_blocks
+
+                    blocks, action_id = build_update_person_blocks(
+                        district_name=district_label,
+                        pipedrive_org_id=org_id,
+                        pipedrive_person_id=int(contact["pipedrive_person_id"]),
+                        contact=contact,
+                        slack_channel=channel_id,
+                    )
+                    summary = f"Update {contact.get('name', '')} — {district_label}"
+                    ts = await slack.post_thread(thread_ts, summary, blocks=blocks)
+                    if ts:
+                        attach_slack_message_to_action(action_id=action_id, slack_message_ts=ts)
+                except Exception as e:
+                    print(f"[pipeline] block kit update fell back to text: {e}")
+                    msg = slack.format_updated_contact(contact, date_str)
+                    await slack.post_thread(thread_ts, msg)
+            else:
+                msg = slack.format_updated_contact(contact, date_str)
+                await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
         # Post new contacts
         for contact in new:
-            msg = slack.format_new_contact(contact, org_id, date_str)
-            await slack.post_thread(thread_ts, msg)
+            if use_blocks:
+                try:
+                    from app.database import attach_slack_message_to_action
+                    from app.slack_blocks import build_create_person_blocks
+
+                    blocks, action_id = build_create_person_blocks(
+                        district_name=district_label,
+                        pipedrive_org_id=org_id,
+                        contact=contact,
+                        slack_channel=channel_id,
+                    )
+                    summary = f"New contact {contact.get('name', '')} — {district_label}"
+                    ts = await slack.post_thread(thread_ts, summary, blocks=blocks)
+                    if ts:
+                        attach_slack_message_to_action(action_id=action_id, slack_message_ts=ts)
+                except Exception as e:
+                    print(f"[pipeline] block kit create fell back to text: {e}")
+                    msg = slack.format_new_contact(contact, org_id, date_str)
+                    await slack.post_thread(thread_ts, msg)
+            else:
+                msg = slack.format_new_contact(contact, org_id, date_str)
+                await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
-        # Post missing contacts (person payload + note in same message)
+        # Post missing contacts (mark-former)
         for contact in missing:
-            msg = slack.format_missing_contact(contact, website_url, date_str)
-            await slack.post_thread(thread_ts, msg)
+            if use_blocks and contact.get("pipedrive_person_id"):
+                try:
+                    from app.database import attach_slack_message_to_action
+                    from app.slack_blocks import build_mark_former_blocks
+
+                    blocks, action_id = build_mark_former_blocks(
+                        district_name=district_label,
+                        pipedrive_org_id=org_id,
+                        pipedrive_person_id=int(contact["pipedrive_person_id"]),
+                        contact=contact,
+                        slack_channel=channel_id,
+                    )
+                    summary = f"Possibly former: {contact.get('name', '')} — {district_label}"
+                    ts = await slack.post_thread(thread_ts, summary, blocks=blocks)
+                    if ts:
+                        attach_slack_message_to_action(action_id=action_id, slack_message_ts=ts)
+                except Exception as e:
+                    print(f"[pipeline] block kit mark-former fell back to text: {e}")
+                    msg = slack.format_missing_contact(contact, website_url, date_str)
+                    await slack.post_thread(thread_ts, msg)
+            else:
+                msg = slack.format_missing_contact(contact, website_url, date_str)
+                await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
         # Post deal alerts for missing contacts who are still the main contact on open deals
@@ -382,6 +448,41 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
 async def health():
     """Health check endpoint."""
     return {"status": "ok", "service": "district-contact-agent"}
+
+
+@app.post("/slack/interact")
+async def slack_interact(request: Request):
+    """
+    Slack Block Kit interactivity callback. Verifies the signature, parses
+    the payload, and dispatches to :mod:`app.slack_interact` to claim and
+    execute the corresponding ``pending_actions`` row.
+    """
+    from app.slack_interact import (
+        handle_slack_interaction,
+        parse_form_payload,
+        verify_slack_signature,
+    )
+
+    settings = get_settings()
+    signing_secret = settings.slack_signing_secret or ""
+    raw_body = await request.body()
+    timestamp = request.headers.get("x-slack-request-timestamp") or ""
+    signature = request.headers.get("x-slack-signature") or ""
+
+    if not signing_secret:
+        raise HTTPException(status_code=503, detail="SLACK_SIGNING_SECRET not configured")
+    if not verify_slack_signature(signing_secret, raw_body, timestamp, signature):
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    payload = parse_form_payload(raw_body)
+    if not payload:
+        raise HTTPException(status_code=400, detail="missing or invalid payload")
+
+    response = await handle_slack_interaction(payload)
+    # Slack expects 200 within 3s even when we've already posted via
+    # response_url; returning the same body lets clients that don't honour
+    # response_url (e.g. curl-based test harnesses) see the outcome too.
+    return JSONResponse(response or {"text": "ok"})
 
 
 @app.post("/webhook/pipedrive")
@@ -669,6 +770,59 @@ async def approve_contacts(payload: ApproveContactsRequest, background_tasks: Ba
         return {"status": "ok", "queued": 0}
     background_tasks.add_task(_write_approved_to_pipedrive, payload.new_contact_ids)
     return {"status": "accepted", "queued": len(payload.new_contact_ids)}
+
+
+class EvalRunRequest(BaseModel):
+    run_label: str | None = None
+    research_mode: str = "pipeline"  # 'pipeline' | 'hybrid' | 'full_agent'
+    limit: int | None = None
+    concurrency: int | None = None
+
+
+async def _run_eval_background(payload: EvalRunRequest) -> None:
+    from app.eval import run_eval, format_eval_summary_for_slack
+    try:
+        summary = await run_eval(
+            run_label=payload.run_label,
+            research_mode=payload.research_mode,
+            limit=payload.limit,
+            concurrency=payload.concurrency,
+        )
+        print(f"[eval] Run complete: {summary}")
+        try:
+            slack = SlackClient()
+            await slack.post_message(format_eval_summary_for_slack(summary))
+        except Exception as se:
+            print(f"[eval] Slack post failed: {se}")
+    except Exception as e:
+        print(f"[eval] Run failed: {e}")
+        traceback.print_exc()
+        try:
+            slack = SlackClient()
+            await slack.post_message(
+                f":x: *Eval run failed*\nError: `{type(e).__name__}: {str(e)[:400]}`"
+            )
+        except Exception:
+            pass
+
+
+@app.post("/eval/run")
+async def eval_run(payload: EvalRunRequest, background_tasks: BackgroundTasks):
+    """
+    Kick off an evaluation run against the golden set in ``eval_districts``.
+    Each run is scored and persisted to ``eval_runs``; a summary is posted
+    to Slack when the run completes.
+    """
+    settings = get_settings()
+    if not settings.supabase_url or not settings.firecrawl_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Eval harness requires SUPABASE_URL, SUPABASE_SERVICE_KEY, and FIRECRAWL_API_KEY.",
+        )
+    if payload.research_mode not in ("pipeline", "hybrid", "full_agent"):
+        raise HTTPException(status_code=400, detail="research_mode must be pipeline|hybrid|full_agent")
+    background_tasks.add_task(_run_eval_background, payload)
+    return {"status": "accepted", "research_mode": payload.research_mode}
 
 
 @app.post("/batch/test-url")

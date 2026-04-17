@@ -141,6 +141,33 @@ async def _process_one_district(
                 pages, org_name, website_url
             )
 
+            # Step 2b: Optional hunter gap-fill (Phase 3 hybrid mode).
+            # Honours per-district `research_mode` override, falling back to
+            # the global Settings.contact_hunter_mode.
+            district_mode = (district.get("research_mode") or settings.contact_hunter_mode or "pipeline").lower()
+            if district_mode in ("hybrid", "full_agent"):
+                try:
+                    from app.pipeline_research import (
+                        _normalize_hunter_contacts,
+                        _run_contact_hunter_gap_fill,
+                    )
+                    hunter_contacts, hunter_meta = await _run_contact_hunter_gap_fill(
+                        org_name=org_name,
+                        website_url=website_url,
+                        district_state=district.get("state"),
+                        district_id=district_id,
+                        extracted=contacts,
+                        firecrawl_usage=fc_usage,
+                    )
+                    if hunter_contacts:
+                        print(
+                            f"[batch] {org_name}: hunter added {len(hunter_contacts)} "
+                            f"contact(s) ({hunter_meta.get('hunt_id')})"
+                        )
+                        contacts = contacts + _normalize_hunter_contacts(hunter_contacts)
+                except Exception as e:
+                    print(f"[batch] {org_name}: hunter gap-fill failed: {type(e).__name__}: {e}")
+
             # Step 3: Persist to Supabase
             save_found_contacts(district_id, pipedrive_org_id, contacts)
             mark_district_done(district_id)

@@ -377,6 +377,164 @@ def export_new_contacts_to_sheet(sheet_id: str | None = None) -> int:
 
 
 # ─────────────────────────────────────────────────────────────
+# Pending actions (Phase 4 Slack Block Kit)
+# ─────────────────────────────────────────────────────────────
+
+
+def create_pending_action(
+    *,
+    kind: str,
+    payload: dict,
+    pipedrive_org_id: int | None = None,
+    pipedrive_person_id: int | None = None,
+    note_payload: dict | None = None,
+    slack_channel: str | None = None,
+) -> str:
+    """
+    Insert a ``pending`` row in ``pending_actions`` and return its id. The
+    caller later posts a Slack Block Kit message referencing this id; when
+    the user taps the button, the ``/slack/interact`` endpoint claims and
+    executes the action.
+    """
+    client = _get_client()
+    row = {
+        "kind": kind,
+        "payload": payload or {},
+        "pipedrive_org_id": pipedrive_org_id,
+        "pipedrive_person_id": pipedrive_person_id,
+        "note_payload": note_payload,
+        "slack_channel": slack_channel,
+        "status": "pending",
+    }
+    result = client.table("pending_actions").insert(row).execute()
+    data = result.data or []
+    if not data:
+        raise RuntimeError("pending_actions insert returned no row")
+    return str(data[0]["id"])
+
+
+def attach_slack_message_to_action(
+    *,
+    action_id: str,
+    slack_message_ts: str | None = None,
+    slack_response_url: str | None = None,
+) -> None:
+    """Record the Slack message metadata after the Block Kit message posts."""
+    client = _get_client()
+    updates: dict[str, Any] = {}
+    if slack_message_ts:
+        updates["slack_message_ts"] = slack_message_ts
+    if slack_response_url:
+        updates["slack_response_url"] = slack_response_url
+    if not updates:
+        return
+    client.table("pending_actions").update(updates).eq("id", action_id).execute()
+
+
+def claim_pending_action(action_id: str, claimed_by: str | None = None) -> dict | None:
+    """
+    Atomically transition a pending action → ``executing``. Returns the full
+    row if we won the race, or ``None`` if it's already been claimed /
+    executed / cancelled (prevents duplicate API calls from double-clicks).
+    """
+    client = _get_client()
+    update = {
+        "status": "executing",
+        "executed_by": claimed_by,
+    }
+    result = (
+        client.table("pending_actions")
+        .update(update)
+        .eq("id", action_id)
+        .eq("status", "pending")
+        .execute()
+    )
+    data = result.data or []
+    return data[0] if data else None
+
+
+def mark_action_executed(action_id: str, result: dict | None = None) -> None:
+    client = _get_client()
+    client.table("pending_actions").update(
+        {
+            "status": "executed",
+            "executed_at": datetime.now(timezone.utc).isoformat(),
+            "result": result or {},
+        }
+    ).eq("id", action_id).execute()
+
+
+def mark_action_failed(action_id: str, error: str) -> None:
+    client = _get_client()
+    client.table("pending_actions").update(
+        {"status": "failed", "error": error[:2000]}
+    ).eq("id", action_id).execute()
+
+
+def mark_action_cancelled(action_id: str) -> None:
+    client = _get_client()
+    client.table("pending_actions").update({"status": "cancelled"}).eq(
+        "id", action_id
+    ).execute()
+
+
+def get_pending_action(action_id: str) -> dict | None:
+    client = _get_client()
+    result = (
+        client.table("pending_actions").select("*").eq("id", action_id).limit(1).execute()
+    )
+    data = result.data or []
+    return data[0] if data else None
+
+
+# ─────────────────────────────────────────────────────────────
+# Hunter traces (Phase 3 observability)
+# ─────────────────────────────────────────────────────────────
+
+def persist_hunter_trace(
+    *,
+    hunt_id: str,
+    trace: list[dict],
+    district_id: str | None = None,
+    district_name: str | None = None,
+) -> int:
+    """
+    Bulk-insert a ContactHunter trace into ``hunter_traces``. Returns the
+    number of rows written. Swallows exceptions (logging only) so trace
+    failures never break a hunt.
+    """
+    if not trace:
+        return 0
+    client = _get_client()
+    rows: list[dict] = []
+    for i, entry in enumerate(trace, 1):
+        if not isinstance(entry, dict):
+            continue
+        tool = (entry.get("tool") or entry.get("event") or "unknown")[:120]
+        rows.append(
+            {
+                "hunt_id": hunt_id,
+                "district_id": district_id,
+                "district_name": district_name,
+                "step": i,
+                "tool": tool,
+                "args": entry.get("input") or {},
+                "result_summary": entry.get("result") or {},
+                "duration_ms": entry.get("elapsed_ms"),
+                "error": entry.get("error"),
+            }
+        )
+    if not rows:
+        return 0
+    try:
+        client.table("hunter_traces").insert(rows).execute()
+        return len(rows)
+    except Exception as e:
+        print(f"[database] persist_hunter_trace failed: {type(e).__name__}: {e}")
+        return 0
+
+
+# ─────────────────────────────────────────────────────────────
 # Batch status helpers
 # ─────────────────────────────────────────────────────────────
 

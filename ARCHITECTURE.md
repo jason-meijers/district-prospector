@@ -2,7 +2,24 @@
 
 ## Overview
 
-An agentic service that, when triggered from Pipedrive, researches a school district's website to find, verify, and enrich contacts matching target roles. Results are posted to Slack for human review, then executed against Pipedrive via emoji-triggered Zaps.
+An agentic service that, when triggered from Pipedrive, researches a school district's website to find, verify, and enrich contacts matching target roles. Results are posted to Slack for human review, where one-click Block Kit buttons execute the Pipedrive API calls directly against this service (no Zapier parsing required).
+
+## Recent Architectural Changes (2026-04)
+
+The pipeline is now composed of four cooperating layers. Older sections below describe the original (pre-2026-04) flow and remain accurate for the `research_mode='pipeline'` path.
+
+1. **Evaluation harness** — `eval_districts` is a ground-truth set of districts; `POST /eval/run` scores extraction against it and persists results to `eval_runs`. Used for A/B testing changes across `pipeline`, `hybrid`, and `full_agent` modes. See `app/eval.py`.
+2. **Platform adapters** — `app/platforms/` detects common school CMS platforms (SchoolInsites, Finalsite, Apptegy) from homepage HTML. High-confidence detections (≥0.75) bypass Firecrawl+LLM by fetching directly from the platform API (e.g., SchoolInsites `/sys/api/directory`). Unknown platforms fall back to the Firecrawl pipeline.
+3. **ContactHunter agent loop** — `app/contact_hunter.py` is a tool-calling Claude agent with tools: `firecrawl_map`, `firecrawl_search`, `firecrawl_scrape`, `fetch_platform_api`, `commit_contact`, `report_coverage`. Per-district `research_mode` (column on `public.districts`) selects between three modes:
+   - `pipeline` — legacy deterministic pipeline only.
+   - `hybrid` — pipeline first; if role coverage is incomplete (see `app/role_coverage.py`) the hunter runs as a gap-filler.
+   - `full_agent` — the hunter runs the whole research task from scratch.
+   Each tool call is persisted to `hunter_traces` for observability.
+4. **Slack Block Kit interactivity** — The pipeline writes each actionable Pipedrive payload (create / update / mark-former) to `pending_actions` and posts a Block Kit message with buttons whose `action_id` references the row. `POST /slack/interact` verifies the signing secret, atomically claims the row, executes the API call, and updates the original message via Slack's `response_url`. This replaces the emoji-reaction → Zapier parser flow.
+
+All Block Kit behaviour is gated by `SLACK_USE_BLOCK_KIT`. Flipping it back to `false` restores the legacy text format so Zapier parsing still works during cutover.
+
+---
 
 ---
 
