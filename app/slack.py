@@ -11,6 +11,123 @@ from app.config import (
 )
 
 
+def format_research_run_summary(result: dict) -> str | None:
+    """
+    Human-readable breakdown of scrape + extraction strategies for Slack reviewers.
+
+    ``result`` matches the dict returned by :func:`run_firecrawl_research`.
+    Returns None if ``result`` is unusable (should not normally happen).
+    """
+    if not isinstance(result, dict):
+        return None
+
+    settings = get_settings()
+    extraction_model = getattr(settings, "claude_model", "") or "Claude extraction model"
+    triage_model = getattr(settings, "batch_url_triage_model", "") or "Haiku"
+
+    mode_raw = (result.get("research_mode") or "pipeline").lower()
+    strategy_lines = {
+        "pipeline": (
+            "`pipeline` — fixed scrape + extraction only (no ContactHunter)."
+        ),
+        "hybrid": (
+            "`hybrid` — full scrape + extraction first; ContactHunter runs only "
+            "if superintendent / curriculum / CTE-style roles are still missing."
+        ),
+        "full_agent": (
+            "`full_agent` — ContactHunter carries the whole research step "
+            "(batch map/triage path skipped)."
+        ),
+    }
+    strategy = strategy_lines.get(mode_raw, f"`{mode_raw}`")
+
+    ut = result.get("url_triage")
+    ut = ut if isinstance(ut, dict) else {}
+
+    discovery: list[str] = []
+    if ut.get("used_platform_adapter"):
+        plat = ut.get("platform") if isinstance(ut.get("platform"), dict) else {}
+        pname = plat.get("platform") or "unknown CMS"
+        conf = plat.get("confidence")
+        npg = plat.get("pages_returned")
+        suffix = ""
+        if conf is not None:
+            suffix += f", confidence `{conf}`"
+        if npg is not None:
+            suffix += f", `{npg}` page(s)"
+        discovery.append(
+            "• *Where pages came from:* Platform adapter detected "
+            f"`{pname}`{suffix}. Structured/directory-style text was fetched directly; "
+            "Firecrawl map + LLM URL triage were skipped."
+        )
+    elif ut.get("used_full_agent"):
+        discovery.append(
+            "• *Where pages came from:* Skipped for this mode — ContactHunter "
+            "tool calls (map/scrape/search/platform) gathered content instead "
+            "of the batch directory pipeline."
+        )
+    elif ut.get("used_heuristic"):
+        rationale = (ut.get("rationale") or "").strip()
+        discovery.append(
+            "• *Where pages came from:* **Heuristic URL fall back** — the normal "
+            "step is Firecrawl `map` → shortlist links → Haiku picks directory + "
+            "enrichment URLs. That path did not produce usable targets, so the "
+            "service fell back to scoring/heuristic URL selection and scraping "
+            "those pages instead."
+        )
+        if rationale:
+            discovery.append(f"  _Signal: {rationale}_")
+    else:
+        discovery.append(
+            "• *Where pages came from:* **LLM URL triage** "
+            f"(`{triage_model}`) chose staff directory + enrichment URLs from "
+            "Firecrawl map results, then those URLs were scraped."
+        )
+
+    discovery.append(
+        "• *Who extracted contacts:* Batch LLM extraction "
+        f"(`{extraction_model}`) on cleaned markdown from each page "
+        "(per-page character budgets + cross-page dedup where enabled)."
+    )
+
+    hunter = result.get("hunter")
+    hunter = hunter if isinstance(hunter, dict) else {}
+
+    if hunter.get("skipped"):
+        why = hunter.get("reason") or "n/a"
+        discovery.append(
+            f"• *ContactHunter (gap-fill):* Skipped — `{why}`."
+        )
+    elif hunter.get("hunt_id"):
+        tc = hunter.get("tool_calls")
+        stop = hunter.get("stop_reason") or "n/a"
+        elapsed = hunter.get("elapsed_seconds")
+        el_s = f", `{elapsed}s`" if elapsed is not None else ""
+        mb = hunter.get("missing_before") or []
+        mb_s = ""
+        if mb:
+            mb_s = f" Missing cohorts before hunt: {', '.join(str(x) for x in mb)}."
+        discovery.append(
+            "• *ContactHunter:* Ran for missing roles — "
+            f"`{tc}` tool call(s), stop=`{stop}`{el_s}.{mb_s}"
+        )
+    elif mode_raw == "hybrid":
+        discovery.append(
+            "• *ContactHunter:* Did not run (no gap-fill trigger or pipeline-only outcome)."
+        )
+    elif mode_raw == "pipeline":
+        discovery.append(
+            "• *ContactHunter:* Not used (pipeline-only mode)."
+        )
+
+    lines = [
+        "🧩 *How this run got the data*",
+        f"• *Strategy:* {strategy}",
+        *discovery,
+    ]
+    return "\n".join(lines)
+
+
 def slack_plaintext_no_autolink(value: str | None) -> str:
     """
     Slack clients auto-link emails (mailto) and phone numbers (tel), which breaks

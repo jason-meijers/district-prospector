@@ -19,7 +19,11 @@ from app.database import (
     run_dedup_job,
     reset_district_to_pending,
 )
-from app.slack import SlackClient, slack_plaintext_no_autolink
+from app.slack import (
+    SlackClient,
+    format_research_run_summary,
+    slack_plaintext_no_autolink,
+)
 
 
 def _slack_district_org_link(
@@ -148,6 +152,7 @@ async def _process_one_district(
             district_mode = normalize_research_mode(
                 district.get("research_mode") or settings.contact_hunter_mode or "pipeline"
             )
+            hunter_meta: dict | None = None
             if district_mode == "hybrid":
                 try:
                     from app.pipeline_research import (
@@ -192,6 +197,8 @@ async def _process_one_district(
                 "pipedrive_org_id": pipedrive_org_id,
                 "firecrawl_usage": fc_usage,
                 "url_triage": url_triage,
+                "research_mode": district_mode,
+                "hunter": hunter_meta or {},
             }
 
         except Exception as e:
@@ -292,6 +299,15 @@ async def _post_batch_result_to_slack(result: dict) -> None:
         thread_ts = await slack.post_message(parent)
         if not thread_ts:
             return
+
+        methods_payload = {
+            "research_mode": result.get("research_mode") or "pipeline",
+            "url_triage": result.get("url_triage") if isinstance(result.get("url_triage"), dict) else {},
+            "hunter": result.get("hunter") if isinstance(result.get("hunter"), dict) else {},
+        }
+        methods_line = format_research_run_summary(methods_payload)
+        if methods_line:
+            await slack.post_thread(thread_ts, methods_line)
 
         if used_urls:
             urls_preview = "\n".join(f"• {u}" for u in used_urls[:20])

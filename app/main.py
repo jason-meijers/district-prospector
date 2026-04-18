@@ -19,7 +19,11 @@ from app.config import (
     ROLE_CATEGORY_OPTIONS,
 )
 from app.pipedrive import PipedriveClient
-from app.slack import SlackClient, slack_plaintext_no_autolink
+from app.slack import (
+    SlackClient,
+    format_research_run_summary,
+    slack_plaintext_no_autolink,
+)
 from app.agent import ExtractionAgent
 from app.firecrawl_scraper import (
     discover_district_website,
@@ -354,6 +358,11 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
             except Exception as e:
                 print(f"[pipeline] Deal check for missing contacts failed (non-fatal): {e}")
 
+        # Readable summary of scrape + extraction paths (strategy, triage vs heuristic, hunter)
+        methods_summary = format_research_run_summary(result if isinstance(result, dict) else {})
+        if methods_summary:
+            await slack.post_thread(thread_ts, methods_summary)
+
         # Post research notes if present
         notes = result.get("research_notes")
         if notes:
@@ -371,9 +380,12 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         if firecrawl_usage_line:
             await slack.post_thread(thread_ts, f"🔥 *Firecrawl Usage*\n{firecrawl_usage_line}")
 
-        # Post URL triage metadata when available
+        # Post URL triage metadata when relevant (skip when platform adapter —
+        # "How this run got the data" already explains that path).
         url_triage = result.get("url_triage")
-        if isinstance(url_triage, dict) and (
+        if isinstance(url_triage, dict) and not url_triage.get(
+            "used_platform_adapter"
+        ) and not url_triage.get("used_full_agent") and (
             url_triage.get("staff_directory_url")
             or url_triage.get("enrichment_urls")
             or "used_heuristic" in url_triage
@@ -381,12 +393,20 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
             mode = "heuristic fallback" if url_triage.get("used_heuristic") else "triage"
             directory_url = url_triage.get("staff_directory_url") or "N/A"
             enrichment_count = len(url_triage.get("enrichment_urls") or [])
+            heuristic_hint = ""
+            if url_triage.get("used_heuristic"):
+                heuristic_hint = (
+                    "\n_Heuristic fallback means Firecrawl `map` did not yield links for "
+                    "LLM triage, triage picks failed scraping, or triage was skipped — "
+                    "URLs were chosen by scoring instead._\n"
+                )
             triage_line = (
-                f"🧭 *URL Triage*\n"
+                f"🧭 *URL Triage (technical detail)*\n"
                 f"Mode: {mode}\n"
                 f"Directory: `{directory_url}`\n"
                 f"Enrichment URLs: {enrichment_count}\n"
                 f"Rationale: {url_triage.get('rationale') or 'N/A'}"
+                f"{heuristic_hint}"
             )
             await slack.post_thread(thread_ts, triage_line)
 
