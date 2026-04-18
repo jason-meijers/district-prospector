@@ -128,6 +128,18 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
             f"and {len(all_person_names)} total active persons in Pipedrive"
         )
 
+        # Optional Supabase row: enables ContactHunter traces + per-district research_mode.
+        district_row = None
+        try:
+            from app.database import get_district_by_pipedrive_org_id
+
+            district_row = get_district_by_pipedrive_org_id(org_id)
+        except Exception as e:
+            print(f"[pipeline] district lookup skipped: {e}")
+        district_id_str = str(district_row["id"]) if district_row else None
+        district_state = (district_row or {}).get("state")
+        district_research_mode = (district_row or {}).get("research_mode")
+
         # ── Step 2: Run extraction ───────────────────────────────
         website_fallback_used = False
         website_fallback_saved_to_pipedrive = False
@@ -137,6 +149,9 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
                 website_url=website_url,
                 existing_contacts=existing_contacts,
                 all_person_names=all_person_names,
+                district_state=district_state,
+                district_id=district_id_str,
+                research_mode=district_research_mode,
             )
         elif agent:
             result = await agent.run(org_name, website_url, existing_contacts, all_person_names)
@@ -166,6 +181,9 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
                         website_url=website_url,
                         existing_contacts=existing_contacts,
                         all_person_names=all_person_names,
+                        district_state=district_state,
+                        district_id=district_id_str,
+                        research_mode=district_research_mode,
                     )
                 elif agent:
                     result = await agent.run(

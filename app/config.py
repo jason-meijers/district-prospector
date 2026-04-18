@@ -154,9 +154,10 @@ class Settings(BaseSettings):
     google_sheet_id: str | None = None
 
     # ── Contact Hunter (LLM tool-calling agent loop) ────────────
-    # off         — skip agent entirely (legacy pipeline only)
-    # gap_fill    — run pipeline first, invoke agent only when target roles are missing (default)
-    # full        — skip pipeline, let the agent run the whole research end-to-end
+    # Values map via normalize_research_mode (app/pipeline_research.py):
+    # off / pipeline — Firecrawl + batch LLM only
+    # gap_fill / hybrid — pipeline first, then ContactHunter when role coverage has gaps (default)
+    # full / full_agent — ContactHunter runs the whole research task (webhook + eval)
     contact_hunter_mode: Literal["off", "gap_fill", "full"] = "gap_fill"
     hunter_max_tool_calls_gap_fill: int = 8
     hunter_max_tool_calls_full: int = 15

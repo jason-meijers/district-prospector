@@ -293,6 +293,7 @@ async def _evaluate_one(
             existing_contacts=existing_contacts,
             all_person_names=all_person_names,
             district_state=district_state,
+            district_id=str(district_id),
             research_mode=research_mode,
         )
     except TypeError:

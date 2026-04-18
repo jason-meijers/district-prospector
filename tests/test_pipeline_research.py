@@ -6,9 +6,21 @@ import unittest
 from unittest.mock import patch
 
 from app.pipeline_research import (
+    normalize_research_mode,
     reconcile_extracted_contacts,
     run_firecrawl_research,
 )
+
+
+class TestNormalizeResearchMode(unittest.TestCase):
+    def test_maps_legacy_and_internal_labels(self) -> None:
+        self.assertEqual(normalize_research_mode(None), "pipeline")
+        self.assertEqual(normalize_research_mode("off"), "pipeline")
+        self.assertEqual(normalize_research_mode("pipeline"), "pipeline")
+        self.assertEqual(normalize_research_mode("gap_fill"), "hybrid")
+        self.assertEqual(normalize_research_mode("hybrid"), "hybrid")
+        self.assertEqual(normalize_research_mode("full"), "full_agent")
+        self.assertEqual(normalize_research_mode("full_agent"), "full_agent")
 
 
 class TestReconcileExtractedContacts(unittest.TestCase):
@@ -153,6 +165,7 @@ class TestRunFirecrawlResearch(unittest.IsolatedAsyncioTestCase):
             existing_contacts=[],
             all_person_names={},
             district_state=None,
+            research_mode="pipeline",
         )
 
         self.assertEqual(result["district_name"], "Test District")

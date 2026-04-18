@@ -9,6 +9,7 @@ from app.firecrawl_scraper import (
     scrape_district,
 )
 from app.batch_agent import BatchExtractionAgent
+from app.pipeline_research import normalize_research_mode
 from app.database import (
     claim_next_district,
     mark_district_processing,
@@ -143,9 +144,11 @@ async def _process_one_district(
 
             # Step 2b: Optional hunter gap-fill (Phase 3 hybrid mode).
             # Honours per-district `research_mode` override, falling back to
-            # the global Settings.contact_hunter_mode.
-            district_mode = (district.get("research_mode") or settings.contact_hunter_mode or "pipeline").lower()
-            if district_mode in ("hybrid", "full_agent"):
+            # the global Settings.contact_hunter_mode (gap_fill → hybrid).
+            district_mode = normalize_research_mode(
+                district.get("research_mode") or settings.contact_hunter_mode or "pipeline"
+            )
+            if district_mode == "hybrid":
                 try:
                     from app.pipeline_research import (
                         _normalize_hunter_contacts,

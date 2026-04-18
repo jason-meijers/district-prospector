@@ -10,6 +10,29 @@ from app.firecrawl_scraper import scrape_district
 from app.role_coverage import cohort_labels, score_role_coverage
 
 
+def normalize_research_mode(mode: str | None) -> str:
+    """
+    Map ``Settings.contact_hunter_mode`` and ``districts.research_mode`` onto
+    keys used inside :func:`run_firecrawl_research`.
+
+    * ``off`` / ``pipeline`` → ``pipeline`` (fixed Firecrawl + batch LLM only)
+    * ``gap_fill`` / ``hybrid`` → ``hybrid`` (pipeline first, then ContactHunter gap-fill)
+    * ``full`` / ``full_agent`` → ``full_agent`` (ContactHunter carries the whole task)
+    """
+    if mode is None:
+        return "pipeline"
+    raw = str(mode).strip().lower()
+    if not raw:
+        return "pipeline"
+    if raw in ("off", "pipeline"):
+        return "pipeline"
+    if raw in ("gap_fill", "hybrid"):
+        return "hybrid"
+    if raw in ("full", "full_agent"):
+        return "full_agent"
+    return "pipeline"
+
+
 def _norm_name(name: str | None) -> str:
     return (name or "").strip().lower()
 
@@ -288,9 +311,10 @@ async def run_firecrawl_research(
       * ``full_agent`` — skip the pipeline and hand the task to ContactHunter.
     """
     settings = get_settings()
-    mode = (research_mode or settings.contact_hunter_mode or "pipeline").lower()
-    if mode not in ("pipeline", "hybrid", "full_agent"):
-        mode = "pipeline"
+    if research_mode is not None and str(research_mode).strip():
+        mode = normalize_research_mode(str(research_mode))
+    else:
+        mode = normalize_research_mode(settings.contact_hunter_mode)
 
     hunter_meta: dict[str, Any] | None = None
 

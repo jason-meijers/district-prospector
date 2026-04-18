@@ -87,6 +87,33 @@ def mark_district_done(district_id: str) -> None:
     }).eq("id", district_id).execute()
 
 
+def get_district_by_pipedrive_org_id(pipedrive_org_id: int) -> dict[str, Any] | None:
+    """
+    Lookup a districts row by Pipedrive organization id.
+
+    Used by the Pipedrive webhook to pass ``district_id`` / ``research_mode``
+    into :func:`run_firecrawl_research` so hybrid ContactHunter traces and
+    per-row overrides apply. Returns None if Supabase is not configured or no
+    row matches.
+    """
+    try:
+        client = _get_client()
+    except RuntimeError:
+        return None
+    try:
+        result = (
+            client.table("districts")
+            .select("id, research_mode, state")
+            .eq("pipedrive_org_id", pipedrive_org_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
 def mark_district_error(district_id: str, error_message: str) -> None:
     client = _get_client()
     client.table("districts").update({
