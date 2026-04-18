@@ -36,6 +36,47 @@ def _confirm_dialog(title: str, body: str, ok: str, cancel: str = "Nevermind") -
     }
 
 
+def _make_poc_confirm(contact_name: str, deal_count: int, sample_titles: list[str]) -> dict:
+    titles = ", ".join(sample_titles[:3]) if sample_titles else "(see Pipedrive)"
+    if len(sample_titles) > 3:
+        titles += " …"
+    body = (
+        f"This assigns *{contact_name}* as the *main contact* on *{deal_count}* open "
+        f"deal(s) where the current contact is tagged *Former*.\n"
+        f"Includes: {titles}"
+    )
+    if len(body) > 280:
+        body = body[:277] + "…"
+    return _confirm_dialog(
+        title="Make point of contact?",
+        body=body,
+        ok="Yes, assign PoC",
+    )
+
+
+def _make_poc_actions_row(
+    *,
+    action_uuid: str,
+    deal_count: int,
+    contact_name: str,
+    sample_titles: list[str],
+) -> dict:
+    confirm = _make_poc_confirm(contact_name, deal_count, sample_titles)
+    label = f"Make PoC ({deal_count} deal{'s' if deal_count != 1 else ''})"
+    return {
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": label[:75]},
+                "action_id": "pending_action_execute",
+                "value": action_uuid,
+                "confirm": confirm,
+            }
+        ],
+    }
+
+
 def _action_buttons(
     primary_action_id: str,
     primary_label: str,
@@ -77,12 +118,12 @@ def build_create_person_blocks(
     pipedrive_org_id: int,
     contact: dict[str, Any],
     slack_channel: str | None = None,
-) -> tuple[list[dict], str]:
+    former_poc_deals: list[dict] | None = None,
+) -> tuple[list[dict], str, str | None]:
     """
-    Returns ``(blocks, action_id)`` for a "create new person" message. The
-    caller posts ``blocks`` to Slack and should later record the returned
-    ``slack_message_ts`` on the action via
-    :func:`database.attach_slack_message_to_action`.
+    Returns ``(blocks, primary_action_id, make_poc_action_id_or_none)``.
+    ``make_poc_action_id`` is set when there are open deals whose main contact
+    is tagged Former — see :func:`build_update_person_blocks`.
     """
     payload = {
         "name": contact.get("name") or "",
@@ -122,18 +163,58 @@ def build_create_person_blocks(
     if payload.get("source_url"):
         detail_lines.append(f"*Source:* `{payload['source_url']}`")
 
-    blocks = [
+    blocks: list[dict] = [
         _section(header),
         _section("\n".join(detail_lines)),
+    ]
+
+    make_poc_id: str | None = None
+    deals = [d for d in (former_poc_deals or []) if d.get("deal_id") is not None]
+    if deals:
+        deal_ids = [int(d["deal_id"]) for d in deals]
+        titles = [
+            (d.get("title") or "").strip() or f"Deal #{d.get('deal_id')}"
+            for d in deals[:8]
+        ]
+        make_poc_id = create_pending_action(
+            kind="make_poc",
+            payload={
+                "deal_ids": deal_ids,
+                "contact_name": payload["name"] or "",
+                "deal_titles_sample": titles,
+            },
+            pipedrive_org_id=pipedrive_org_id,
+            pipedrive_person_id=None,
+            slack_channel=slack_channel,
+        )
+        blocks.append(
+            _section(
+                f"_There {'are' if len(deals) != 1 else 'is'} *{len(deals)}* open "
+                f"deal(s) with a *Former* main contact. After you create this person, "
+                f"click *Make PoC* to assign them on those deals._"
+            )
+        )
+
+    blocks.append(
         _action_buttons(
             primary_action_id="pending_action_execute",
             primary_label="Create in Pipedrive",
             primary_value=action_id,
             include_cancel_value=action_id,
-        ),
-        _context(f":id: `{action_id}`"),
-    ]
-    return blocks, action_id
+        )
+    )
+    if make_poc_id:
+        blocks.append(
+            _make_poc_actions_row(
+                action_uuid=make_poc_id,
+                deal_count=len(deals),
+                contact_name=payload["name"] or "This contact",
+                sample_titles=titles,
+            )
+        )
+
+    blocks.append(_context(f":id: `{action_id}`"))
+    return blocks, action_id, make_poc_id
 
 
 # ── Builder: update_person ─────────────────────────────────────────
@@ -146,7 +227,8 @@ def build_update_person_blocks(
     pipedrive_person_id: int,
     contact: dict[str, Any],
     slack_channel: str | None = None,
-) -> tuple[list[dict], str]:
+    former_poc_deals: list[dict] | None = None,
+) -> tuple[list[dict], str, str | None]:
     changes = contact.get("changes") or []
     payload = {
         "name": contact.get("name") or "",
@@ -181,18 +263,57 @@ def build_update_person_blocks(
     if "role_category" in changes and payload.get("role_category_label"):
         detail_lines.append(f"*Role category →* {payload['role_category_label']}")
 
-    blocks = [
+    blocks: list[dict] = [
         _section(header),
         _section("\n".join(detail_lines)),
+    ]
+
+    make_poc_id: str | None = None
+    deals = [d for d in (former_poc_deals or []) if d.get("deal_id") is not None]
+    if deals:
+        deal_ids = [int(d["deal_id"]) for d in deals]
+        titles = [
+            (d.get("title") or "").strip() or f"Deal #{d.get('deal_id')}"
+            for d in deals[:8]
+        ]
+        make_poc_id = create_pending_action(
+            kind="make_poc",
+            payload={
+                "deal_ids": deal_ids,
+                "contact_name": payload["name"] or "",
+                "deal_titles_sample": titles,
+            },
+            pipedrive_org_id=pipedrive_org_id,
+            pipedrive_person_id=int(pipedrive_person_id),
+            slack_channel=slack_channel,
+        )
+        blocks.append(
+            _section(
+                f"_Open deal(s) above have a *Former* main contact — use *Make PoC* "
+                f"to switch them to *{payload['name'] or 'this person'}*._"
+            )
+        )
+
+    blocks.append(
         _action_buttons(
             primary_action_id="pending_action_execute",
             primary_label="Apply update",
             primary_value=action_id,
             include_cancel_value=action_id,
-        ),
-        _context(f":id: `{action_id}` · person `{pipedrive_person_id}`"),
-    ]
-    return blocks, action_id
+        )
+    )
+    if make_poc_id:
+        blocks.append(
+            _make_poc_actions_row(
+                action_uuid=make_poc_id,
+                deal_count=len(deals),
+                contact_name=payload["name"] or "This contact",
+                sample_titles=titles,
+            )
+        )
+
+    blocks.append(_context(f":id: `{action_id}` · person `{pipedrive_person_id}`"))
+    return blocks, action_id, make_poc_id
 
 
 # ── Builder: mark_former ───────────────────────────────────────────

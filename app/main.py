@@ -251,6 +251,15 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         district_label = org_name
         channel_id = settings.slack_channel_id
 
+        former_poc_deals: list[dict] = []
+        if use_blocks:
+            try:
+                former_poc_deals = await pipedrive.list_open_deals_with_former_main_contact(
+                    org_id
+                )
+            except Exception as e:
+                print(f"[pipeline] Former-PoC deal list failed: {e}")
+
         # Post confirmed contacts — no action required, text only works fine.
         for contact in confirmed:
             msg = slack.format_confirmed_contact(contact)
@@ -264,17 +273,22 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
                     from app.database import attach_slack_message_to_action
                     from app.slack_blocks import build_update_person_blocks
 
-                    blocks, action_id = build_update_person_blocks(
+                    blocks, action_id, poc_id = build_update_person_blocks(
                         district_name=district_label,
                         pipedrive_org_id=org_id,
                         pipedrive_person_id=int(contact["pipedrive_person_id"]),
                         contact=contact,
                         slack_channel=channel_id,
+                        former_poc_deals=former_poc_deals,
                     )
                     summary = f"Update {contact.get('name', '')} — {district_label}"
                     ts = await slack.post_thread(thread_ts, summary, blocks=blocks)
                     if ts:
                         attach_slack_message_to_action(action_id=action_id, slack_message_ts=ts)
+                        if poc_id:
+                            attach_slack_message_to_action(
+                                action_id=poc_id, slack_message_ts=ts
+                            )
                 except Exception as e:
                     print(f"[pipeline] block kit update fell back to text: {e}")
                     msg = slack.format_updated_contact(contact, date_str)
@@ -291,16 +305,21 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
                     from app.database import attach_slack_message_to_action
                     from app.slack_blocks import build_create_person_blocks
 
-                    blocks, action_id = build_create_person_blocks(
+                    blocks, action_id, poc_id = build_create_person_blocks(
                         district_name=district_label,
                         pipedrive_org_id=org_id,
                         contact=contact,
                         slack_channel=channel_id,
+                        former_poc_deals=former_poc_deals,
                     )
                     summary = f"New contact {contact.get('name', '')} — {district_label}"
                     ts = await slack.post_thread(thread_ts, summary, blocks=blocks)
                     if ts:
                         attach_slack_message_to_action(action_id=action_id, slack_message_ts=ts)
+                        if poc_id:
+                            attach_slack_message_to_action(
+                                action_id=poc_id, slack_message_ts=ts
+                            )
                 except Exception as e:
                     print(f"[pipeline] block kit create fell back to text: {e}")
                     msg = slack.format_new_contact(contact, org_id, date_str)

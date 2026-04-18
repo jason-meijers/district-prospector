@@ -4,6 +4,7 @@ from app.config import (
     get_settings,
     PIPEDRIVE_WEBSITE_FIELD_KEY,
     PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY,
+    ROLE_CATEGORY_BY_LABEL,
 )
 
 
@@ -169,6 +170,113 @@ class PipedriveClient:
                 else:
                     break
         return deals
+
+    def _person_role_category_id_raw(self, person: dict) -> int | None:
+        """Role category id from a raw /persons API record (any role)."""
+        custom_fields = person.get("custom_fields") or {}
+        role_id = (
+            custom_fields.get(PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY)
+            or person.get(PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY)
+        )
+        if isinstance(role_id, dict):
+            role_id = role_id.get("id")
+        try:
+            return int(role_id) if role_id is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def list_open_deals_with_former_main_contact(self, org_id: int) -> list[dict]:
+        """
+        Open deals for this org whose *main contact* has Role Category = Former.
+        Used for the Slack "Make PoC" action.
+        """
+        former_id = ROLE_CATEGORY_BY_LABEL.get("Former")
+        if former_id is None:
+            former_id = 475
+
+        deals = await self.get_org_deals(org_id, status="open")
+        persons = await self.get_org_persons(org_id)
+        pid_to_role: dict[int, int | None] = {}
+        for p in persons:
+            pid = p.get("id")
+            if pid is not None:
+                pid_to_role[int(pid)] = self._person_role_category_id_raw(p)
+
+        out: list[dict] = []
+        for d in deals:
+            pid = d.get("person_id")
+            if not pid:
+                continue
+            try:
+                ipid = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if pid_to_role.get(ipid) == former_id:
+                out.append(d)
+        return out
+
+    async def update_deal_main_contact(self, deal_id: int, person_id: int) -> dict:
+        """Set the deal's primary person (main contact)."""
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.put(
+                f"{self.base_url}/deals/{int(deal_id)}",
+                params=self._params(),
+                json={"person_id": int(person_id)},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("data") or {}
+
+    async def find_org_person_id_by_name(self, org_id: int, name: str) -> int | None:
+        """
+        Resolve a person id in the org by display name (exact match, then loose token overlap).
+        Used when Make PoC is clicked on a *new* contact after the person was created in Pipedrive.
+        """
+        raw = (name or "").strip()
+        if not raw:
+            return None
+        norm = raw.lower()
+        persons = await self.get_org_persons(org_id)
+
+        def _norm_person_name(s: str) -> str:
+            return " ".join(s.lower().split())
+
+        for p in persons:
+            if not p.get("active_flag", True):
+                continue
+            if p.get("deleted") or p.get("archived") or p.get("merge_into_id"):
+                continue
+            pname = (p.get("name") or "").strip()
+            if not pname:
+                continue
+            if _norm_person_name(pname) == _norm_person_name(raw):
+                pid = p.get("id")
+                return int(pid) if pid is not None else None
+
+        # Token overlap (handles "Jane Smith" vs "Smith, Jane")
+        def _tokens(s: str) -> set[str]:
+            return {t for t in _norm_person_name(s).replace(",", " ").split() if len(t) > 1}
+
+        want = _tokens(raw)
+        if not want:
+            return None
+        best_id: int | None = None
+        best_score = 0
+        for p in persons:
+            if not p.get("active_flag", True):
+                continue
+            if p.get("deleted") or p.get("archived") or p.get("merge_into_id"):
+                continue
+            pname = (p.get("name") or "").strip()
+            if not pname:
+                continue
+            got = _tokens(pname)
+            score = len(want & got)
+            if score > best_score and score >= min(2, len(want)):
+                best_score = score
+                pid = p.get("id")
+                best_id = int(pid) if pid is not None else None
+        return best_id
 
     def get_all_person_names(self, persons: list[dict]) -> dict[str, int]:
         """

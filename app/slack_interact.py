@@ -35,6 +35,7 @@ from app.database import (
     mark_action_executed,
     mark_action_failed,
 )
+from app.pipedrive import PipedriveClient
 
 
 # ── Signature verification ────────────────────────────────────────
@@ -201,10 +202,51 @@ async def _execute_mark_former(action: dict) -> dict:
     return {"pipedrive_person_id": person_id, "note_id": note.get("id")}
 
 
+async def _execute_make_poc(action: dict) -> dict:
+    """
+    Set this person as the main contact on open deals where the current
+    contact is tagged Former (deal ids stored in payload at post time).
+    """
+    payload = action.get("payload") or {}
+    deal_ids = payload.get("deal_ids") or []
+    org_id = action.get("pipedrive_org_id")
+    person_id = action.get("pipedrive_person_id")
+    hint_name = (payload.get("contact_name") or "").strip()
+
+    if not org_id:
+        raise ValueError("make_poc missing pipedrive_org_id")
+    if not deal_ids:
+        return {"pipedrive_person_id": person_id, "deals_updated": []}
+
+    pd = PipedriveClient()
+    if not person_id:
+        if not hint_name:
+            raise ValueError(
+                "Approve “Create in Pipedrive” first, then click Make PoC — "
+                "no person id yet."
+            )
+        resolved = await pd.find_org_person_id_by_name(int(org_id), hint_name)
+        if not resolved:
+            raise ValueError(
+                f"Could not find a person named “{hint_name}” in this org. "
+                "Create the contact or adjust the name in Pipedrive, then try again."
+            )
+        person_id = resolved
+
+    pid = int(person_id)
+    updated: list[int] = []
+    for raw_id in deal_ids:
+        await pd.update_deal_main_contact(int(raw_id), pid)
+        updated.append(int(raw_id))
+
+    return {"pipedrive_person_id": pid, "deals_updated": updated}
+
+
 _EXECUTORS = {
     "create_person": _execute_create_person,
     "update_person": _execute_update_person,
     "mark_former": _execute_mark_former,
+    "make_poc": _execute_make_poc,
 }
 
 
@@ -303,6 +345,14 @@ def _format_success(kind: str, result: dict, user_label: str) -> str:
     if kind == "mark_former":
         pid = result.get("pipedrive_person_id")
         return f":white_check_mark: Flagged person `{pid}` as former · by {user_label}"
+    if kind == "make_poc":
+        pid = result.get("pipedrive_person_id")
+        deals = result.get("deals_updated") or []
+        n = len(deals)
+        return (
+            f":white_check_mark: Set person `{pid}` as main contact on *{n}* "
+            f"deal(s) · by {user_label}"
+        )
     return f":white_check_mark: Done · by {user_label}"
 
 
