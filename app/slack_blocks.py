@@ -240,13 +240,18 @@ def build_create_person_blocks(
             (d.get("title") or "").strip() or f"Deal #{d.get('deal_id')}"
             for d in deals[:8]
         ]
+        poc_payload: dict[str, Any] = {
+            "deal_ids": deal_ids,
+            "contact_name": payload["name"] or "",
+            "deal_titles_sample": titles,
+            # Lets /slack/interact create the person if they click Make PoC first.
+            "create_payload": dict(payload),
+        }
+        if contact.get("notes"):
+            poc_payload["notes_for_create"] = contact["notes"]
         make_poc_id = create_pending_action(
             kind="make_poc",
-            payload={
-                "deal_ids": deal_ids,
-                "contact_name": payload["name"] or "",
-                "deal_titles_sample": titles,
-            },
+            payload=poc_payload,
             pipedrive_org_id=pipedrive_org_id,
             pipedrive_person_id=None,
             slack_channel=slack_channel,
@@ -254,8 +259,8 @@ def build_create_person_blocks(
         blocks.append(
             _section(
                 f"_There {'are' if len(deals) != 1 else 'is'} *{len(deals)}* open "
-                f"deal(s) with a *Former* main contact. After you create this person, "
-                f"click *Make PoC* to assign them on those deals._"
+                f"deal(s) with a *Former* main contact. Use *Create in Pipedrive* or "
+                f"*Make PoC* (we create the person if they are not in Pipedrive yet)._"
             )
         )
 

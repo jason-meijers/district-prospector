@@ -118,13 +118,14 @@ def _strip_salutation(raw_name: str) -> tuple[str, int | None]:
     return raw_name, None
 
 
-async def _execute_create_person(action: dict) -> dict:
+async def _perform_create_person(
+    *,
+    pipedrive_org_id: int,
+    payload: dict[str, Any],
+    note_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """POST v2 person + optional v1 note. Shared by create_person and make_poc."""
     settings = get_settings()
-    payload = action.get("payload") or {}
-    org_id = action.get("pipedrive_org_id")
-    if not org_id:
-        raise ValueError("create_person missing pipedrive_org_id")
-
     raw_name = (payload.get("name") or "").strip()
     if not raw_name:
         raise ValueError("create_person missing name")
@@ -138,7 +139,7 @@ async def _execute_create_person(action: dict) -> dict:
 
     body: dict[str, Any] = {
         "name": clean_name,
-        "org_id": int(org_id),
+        "org_id": int(pipedrive_org_id),
         "job_title": payload.get("job_title") or "",
         "custom_fields": custom_fields,
     }
@@ -159,22 +160,32 @@ async def _execute_create_person(action: dict) -> dict:
 
     pid = person.get("id")
     note_meta: dict[str, Any] = {}
-    note_row = action.get("note_payload") or {}
+    note_row = note_payload or {}
     note_content = (note_row.get("content") or "").strip()
     if note_content and pid:
         note = await _post_v1_note(
             person_id=int(pid),
-            org_id=int(org_id) if org_id else None,
+            org_id=int(pipedrive_org_id),
             content=note_content,
         )
         note_meta = {"note_id": note.get("id"), "note_added": True}
 
-    out: dict[str, Any] = {
+    return {
         "pipedrive_person_id": pid,
         "name": clean_name,
         **note_meta,
     }
-    return out
+
+
+async def _execute_create_person(action: dict) -> dict:
+    org_id = action.get("pipedrive_org_id")
+    if not org_id:
+        raise ValueError("create_person missing pipedrive_org_id")
+    return await _perform_create_person(
+        pipedrive_org_id=int(org_id),
+        payload=action.get("payload") or {},
+        note_payload=action.get("note_payload"),
+    )
 
 
 async def _execute_update_person(action: dict) -> dict:
@@ -272,6 +283,10 @@ async def _execute_make_poc(action: dict) -> dict:
     """
     Set this person as the main contact on open deals where the current
     contact is tagged Former (deal ids stored in payload at post time).
+
+    For *new* contacts (no ``pipedrive_person_id``), we first look up by name;
+    if not found and ``create_payload`` is present (new-contact Slack row),
+    we create the person in Pipedrive, then assign deals.
     """
     payload = action.get("payload") or {}
     deal_ids = payload.get("deal_ids") or []
@@ -285,19 +300,36 @@ async def _execute_make_poc(action: dict) -> dict:
         return {"pipedrive_person_id": person_id, "deals_updated": []}
 
     pd = PipedriveClient()
+    created_person_first = False
+    created_name: str | None = None
+
     if not person_id:
-        if not hint_name:
-            raise ValueError(
-                "Approve “Create in Pipedrive” first, then click Make PoC — "
-                "no person id yet."
+        resolved = None
+        if hint_name:
+            resolved = await pd.find_org_person_id_by_name(int(org_id), hint_name)
+        if resolved:
+            person_id = resolved
+        else:
+            create_payload = payload.get("create_payload")
+            if not isinstance(create_payload, dict) or not (create_payload.get("name") or "").strip():
+                raise ValueError(
+                    "No matching person in this org — use *Create in Pipedrive* first, "
+                    "or click *Make PoC* again after this message is regenerated."
+                )
+            note_pl: dict[str, Any] | None = None
+            notes = payload.get("notes_for_create")
+            if notes:
+                note_pl = {"content": f"Extracted during District Prospector run: {notes}"}
+            created = await _perform_create_person(
+                pipedrive_org_id=int(org_id),
+                payload=create_payload,
+                note_payload=note_pl,
             )
-        resolved = await pd.find_org_person_id_by_name(int(org_id), hint_name)
-        if not resolved:
-            raise ValueError(
-                f"Could not find a person named “{hint_name}” in this org. "
-                "Create the contact or adjust the name in Pipedrive, then try again."
-            )
-        person_id = resolved
+            person_id = created.get("pipedrive_person_id")
+            if not person_id:
+                raise ValueError("Create person did not return a Pipedrive id")
+            created_person_first = True
+            created_name = str(created.get("name") or "")
 
     pid = int(person_id)
     updated: list[int] = []
@@ -305,7 +337,11 @@ async def _execute_make_poc(action: dict) -> dict:
         await pd.update_deal_main_contact(int(raw_id), pid)
         updated.append(int(raw_id))
 
-    return {"pipedrive_person_id": pid, "deals_updated": updated}
+    out: dict[str, Any] = {"pipedrive_person_id": pid, "deals_updated": updated}
+    if created_person_first:
+        out["created_person_first"] = True
+        out["created_name"] = created_name
+    return out
 
 
 _EXECUTORS = {
@@ -434,6 +470,13 @@ async def handle_slack_interaction(payload: dict) -> dict:
     try:
         result = await executor(claimed)
         mark_action_executed(value, result=result)
+        if (
+            kind == "make_poc"
+            and isinstance(result, dict)
+            and result.get("created_person_first")
+        ):
+            # Sibling "Create in Pipedrive" pending row would otherwise allow a duplicate insert.
+            cancel_pending_actions_for_slack_message_ts(claimed.get("slack_message_ts"))
         summary = _format_success(kind, result, user_label)
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)[:400]}"
@@ -483,6 +526,12 @@ def _format_success(kind: str, result: dict, user_label: str) -> str:
         pid = result.get("pipedrive_person_id")
         deals = result.get("deals_updated") or []
         n = len(deals)
+        if result.get("created_person_first"):
+            nm = result.get("created_name") or "contact"
+            return (
+                f":white_check_mark: Created *{nm}* in Pipedrive, then set as main contact "
+                f"on *{n}* deal(s) · by {user_label}"
+            )
         return (
             f":white_check_mark: Set person `{pid}` as main contact on *{n}* "
             f"deal(s) · by {user_label}"
