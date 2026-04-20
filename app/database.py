@@ -6,6 +6,10 @@ from typing import Any
 from supabase import create_client, Client
 from app.config import get_settings
 
+# After the first PGRST205 (table missing), skip DB calls until process restart.
+_skips_table_unavailable = False
+_logged_skips_table_missing = False
+
 # Salutation prefixes to strip when normalising names for fuzzy matching.
 _SALUTATION_RE = re.compile(
     r"^(dr\.?|mr\.?|mrs\.?|ms\.?|prof\.?|rev\.?)\s+",
@@ -530,6 +534,30 @@ def make_create_name_key(name: str | None, job_title: str | None) -> str:
     return f"{n}|{t}"
 
 
+def _contact_review_skips_table_error(exc: BaseException) -> bool:
+    """True if Supabase/PostgREST reports the skips table is missing (migration not applied)."""
+    msg = str(exc).lower()
+    code = getattr(exc, "code", None)
+    if code == "PGRST205":
+        return True
+    return "contact_review_skips" in msg and (
+        "schema cache" in msg or "does not exist" in msg or "pgrst205" in msg
+    )
+
+
+def _note_skips_table_missing() -> None:
+    global _skips_table_unavailable, _logged_skips_table_missing
+    _skips_table_unavailable = True
+    if not _logged_skips_table_missing:
+        _logged_skips_table_missing = True
+        print(
+            "[database] Table public.contact_review_skips is missing — apply "
+            "supabase/migrations/20260418140000_contact_review_skips.sql (or "
+            "`supabase db push`), then restart the app. Slack skip memory is "
+            "disabled until the table exists."
+        )
+
+
 def is_contact_review_skipped(
     *,
     pipedrive_org_id: int,
@@ -538,22 +566,31 @@ def is_contact_review_skipped(
     create_name_key: str | None = None,
 ) -> bool:
     """Whether the user already dismissed this Block Kit prompt for a later run."""
+    if _skips_table_unavailable:
+        return False
     if pipedrive_person_id is None and not create_name_key:
         return False
-    client = _get_client()
-    q = (
-        client.table("contact_review_skips")
-        .select("id")
-        .eq("pipedrive_org_id", pipedrive_org_id)
-        .eq("kind", kind)
-        .limit(1)
-    )
-    if pipedrive_person_id is not None:
-        q = q.eq("pipedrive_person_id", pipedrive_person_id)
-    else:
-        q = q.eq("create_name_key", create_name_key or "")
-    result = q.execute()
-    return bool(result.data)
+    try:
+        client = _get_client()
+        q = (
+            client.table("contact_review_skips")
+            .select("id")
+            .eq("pipedrive_org_id", pipedrive_org_id)
+            .eq("kind", kind)
+            .limit(1)
+        )
+        if pipedrive_person_id is not None:
+            q = q.eq("pipedrive_person_id", pipedrive_person_id)
+        else:
+            q = q.eq("create_name_key", create_name_key or "")
+        result = q.execute()
+        return bool(result.data)
+    except Exception as e:
+        if _contact_review_skips_table_error(e):
+            _note_skips_table_missing()
+            return False
+        print(f"[database] is_contact_review_skipped failed: {type(e).__name__}: {e}")
+        return False
 
 
 def record_contact_review_skip(
@@ -565,6 +602,8 @@ def record_contact_review_skip(
     skipped_by: str | None = None,
 ) -> None:
     """Persist a skip so future research runs post text-only (no buttons) for this case."""
+    if _skips_table_unavailable:
+        return
     if pipedrive_org_id is None:
         return
     if pipedrive_person_id is None and not create_name_key:
@@ -576,15 +615,21 @@ def record_contact_review_skip(
         create_name_key=create_name_key,
     ):
         return
-    client = _get_client()
-    row: dict[str, Any] = {
-        "pipedrive_org_id": pipedrive_org_id,
-        "kind": kind,
-        "pipedrive_person_id": pipedrive_person_id,
-        "create_name_key": create_name_key,
-        "skipped_by": skipped_by,
-    }
-    client.table("contact_review_skips").insert(row).execute()
+    try:
+        client = _get_client()
+        row: dict[str, Any] = {
+            "pipedrive_org_id": pipedrive_org_id,
+            "kind": kind,
+            "pipedrive_person_id": pipedrive_person_id,
+            "create_name_key": create_name_key,
+            "skipped_by": skipped_by,
+        }
+        client.table("contact_review_skips").insert(row).execute()
+    except Exception as e:
+        if _contact_review_skips_table_error(e):
+            _note_skips_table_missing()
+            return
+        print(f"[database] record_contact_review_skip failed: {type(e).__name__}: {e}")
 
 
 def get_pending_action(action_id: str) -> dict | None:
