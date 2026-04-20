@@ -29,6 +29,7 @@ from app.config import (
     ROLE_CATEGORY_OPTIONS,
     get_settings,
 )
+from app.text_sanitize import sanitize_contact_dict
 from app.role_coverage import score_role_coverage
 
 
@@ -465,16 +466,19 @@ class ContactHunter:
         name = (payload.get("name") or "").strip()
         if not name:
             return
-        contact = {
-            "name": name,
-            "title": (payload.get("title") or "").strip(),
-            "email": (payload.get("email") or "").strip().lower() or None,
-            "phone": (payload.get("phone") or "").strip() or None,
-            "role_category": (payload.get("role_category") or "").strip() or None,
-            "source_url": (payload.get("source_url") or "").strip() or None,
-            "evidence": (payload.get("evidence") or "")[:500] or None,
-            "origin": "contact_hunter",
-        }
+        ev = (payload.get("evidence") or "")[:500] or None
+        contact = sanitize_contact_dict(
+            {
+                "name": name,
+                "title": (payload.get("title") or "").strip(),
+                "email": (payload.get("email") or "").strip().lower() or None,
+                "phone": (payload.get("phone") or "").strip() or None,
+                "role_category": (payload.get("role_category") or "").strip() or None,
+                "source_url": (payload.get("source_url") or "").strip() or None,
+                "evidence": ev,
+                "origin": "contact_hunter",
+            }
+        )
         self._committed.append(contact)
 
 

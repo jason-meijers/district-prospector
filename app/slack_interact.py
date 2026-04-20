@@ -40,6 +40,7 @@ from app.database import (
     record_contact_review_skip,
 )
 from app.pipedrive import PipedriveClient
+from app.text_sanitize import sanitize_contact_dict
 
 FORMER_ROLE_CATEGORY_ID = int(ROLE_CATEGORY_BY_LABEL["Former"])
 
@@ -126,6 +127,7 @@ async def _perform_create_person(
 ) -> dict[str, Any]:
     """POST v2 person + optional v1 note. Shared by create_person and make_poc."""
     settings = get_settings()
+    payload = sanitize_contact_dict(dict(payload))
     raw_name = (payload.get("name") or "").strip()
     if not raw_name:
         raise ValueError("create_person missing name")
@@ -190,7 +192,7 @@ async def _execute_create_person(action: dict) -> dict:
 
 async def _execute_update_person(action: dict) -> dict:
     settings = get_settings()
-    payload = action.get("payload") or {}
+    payload = sanitize_contact_dict(dict(action.get("payload") or {}))
     person_id = action.get("pipedrive_person_id")
     if not person_id:
         raise ValueError("update_person missing pipedrive_person_id")
@@ -236,7 +238,7 @@ async def _execute_mark_former(action: dict) -> dict:
     Set Role Category to *Former* in Pipedrive (v2 PATCH), then add an audit note (v1).
     """
     settings = get_settings()
-    payload = action.get("payload") or {}
+    payload = sanitize_contact_dict(dict(action.get("payload") or {}))
     person_id = action.get("pipedrive_person_id")
     org_id = action.get("pipedrive_org_id")
     if not person_id:
@@ -443,8 +445,8 @@ async def handle_slack_interaction(payload: dict) -> dict:
         else:
             mark_action_cancelled(value)
         return _slack_replace(
-            f":white_check_mark: Marked as *not a target role* — we will not suggest "
-            f"this person in Slack for this district again. · by {user_label}"
+            f":point_right: Not a target role — future runs will post *text only* for this "
+            f"contact. · by {user_label}"
         )
 
     if action_id != "pending_action_execute":

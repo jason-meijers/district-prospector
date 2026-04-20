@@ -8,6 +8,7 @@ from app.batch_agent import BatchExtractionAgent
 from app.config import ROLE_CATEGORY_OPTIONS, get_settings
 from app.firecrawl_scraper import scrape_district
 from app.role_coverage import cohort_labels, score_role_coverage
+from app.text_sanitize import sanitize_contact_dict
 
 
 def normalize_research_mode(mode: str | None) -> str:
@@ -88,7 +89,8 @@ def reconcile_extracted_contacts(
 
     matched_existing_ids: set[int] = set()
 
-    for c in extracted_contacts:
+    for raw in extracted_contacts:
+        c = sanitize_contact_dict(dict(raw))
         name = (c.get("name") or "").strip()
         if not name:
             continue
@@ -190,12 +192,14 @@ def reconcile_extracted_contacts(
         if pid in matched_existing_ids:
             continue
         contacts_out["missing"].append(
-            {
-                "name": ex.get("name") or "",
-                "previous_title": ex.get("job_title") or "",
-                "pipedrive_person_id": pid,
-                "notes": "Not found on current district website pages reviewed in this run.",
-            }
+            sanitize_contact_dict(
+                {
+                    "name": ex.get("name") or "",
+                    "previous_title": ex.get("job_title") or "",
+                    "pipedrive_person_id": pid,
+                    "notes": "Not found on current district website pages reviewed in this run.",
+                }
+            )
         )
 
     return contacts_out

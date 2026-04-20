@@ -4,6 +4,7 @@ import re
 import time
 import anthropic
 from app.config import get_settings, ROLE_CATEGORY_OPTIONS, ROLE_CATEGORY_BY_LABEL
+from app.text_sanitize import sanitize_contact_dict
 from app.scraper import fetch_page, clean_html, get_candidate_urls, looks_like_staff_directory, get_pagination_links, fetch_schoolinsites_directory
 
 # ─────────────────────────────────────────────────────────────
@@ -728,6 +729,12 @@ class ExtractionAgent:
             new = deduped_new
 
         contacts["new"] = new
+        for bucket in ("confirmed", "updated", "new"):
+            contacts[bucket] = [sanitize_contact_dict(dict(c)) for c in (contacts.get(bucket) or [])]
+        if contacts.get("missing"):
+            contacts["missing"] = [
+                sanitize_contact_dict(dict(c)) for c in contacts["missing"]
+            ]
         result["contacts"] = contacts
 
         # Sum token usage from both Claude calls
