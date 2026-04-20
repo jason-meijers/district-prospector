@@ -154,6 +154,13 @@ def reconcile_extracted_contacts(
                     {
                         **base_payload,
                         "previous_title": existing_title,
+                        "previous_email": existing_email or None,
+                        "previous_phone": existing_phone or None,
+                        "previous_role_category_id": existing_role_id,
+                        "previous_role_category_label": _role_label(
+                            existing_role_id,
+                            existing.get("role_category_label"),
+                        ),
                         "changes": changes,
                     }
                 )

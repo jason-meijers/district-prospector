@@ -27,6 +27,51 @@ def _divider() -> dict:
     return {"type": "divider"}
 
 
+def _fmt_field_val(value: Any, *, code: bool = False) -> str:
+    if value is None or value == "":
+        return "(none)"
+    s = str(value).strip()
+    return f"`{s}`" if code else s
+
+
+def _build_update_detail_lines(contact: dict[str, Any]) -> list[str]:
+    """
+    Always include job title, then before → after only for fields in ``changes``.
+    """
+    changes = contact.get("changes") or []
+    title = (contact.get("job_title") or "").strip() or "(unknown)"
+    lines: list[str] = [
+        f"*Job title:* {title}",
+        "",
+        "*What changed (values in Pipedrive → values from this research run):*",
+    ]
+    if not changes:
+        lines.append("_No diff list on this record — compare job title above to Pipedrive if needed._")
+        return lines
+
+    if "title" in changes:
+        lines.append(
+            f"• *Title:* {_fmt_field_val(contact.get('previous_title'))} → "
+            f"{_fmt_field_val(contact.get('job_title'))}"
+        )
+    if "email" in changes:
+        lines.append(
+            f"• *Email:* {_fmt_field_val(contact.get('previous_email'), code=True)} → "
+            f"{_fmt_field_val(contact.get('email'), code=True)}"
+        )
+    if "phone" in changes:
+        lines.append(
+            f"• *Phone:* {_fmt_field_val(contact.get('previous_phone'), code=True)} → "
+            f"{_fmt_field_val(contact.get('phone'), code=True)}"
+        )
+    if "role_category" in changes:
+        lines.append(
+            f"• *Role category:* {_fmt_field_val(contact.get('previous_role_category_label'))} → "
+            f"{_fmt_field_val(contact.get('role_category_label'))}"
+        )
+    return lines
+
+
 def _confirm_dialog(title: str, body: str, ok: str, cancel: str = "Nevermind") -> dict:
     return {
         "title": {"type": "plain_text", "text": title[:100]},
@@ -240,6 +285,10 @@ def build_update_person_blocks(
         "source_url": contact.get("source_url"),
         "changes": list(changes),
         "previous_title": contact.get("previous_title"),
+        "previous_email": contact.get("previous_email"),
+        "previous_phone": contact.get("previous_phone"),
+        "previous_role_category_id": contact.get("previous_role_category_id"),
+        "previous_role_category_label": contact.get("previous_role_category_label"),
     }
     action_id = create_pending_action(
         kind="update_person",
@@ -249,23 +298,13 @@ def build_update_person_blocks(
         slack_channel=slack_channel,
     )
 
-    prev = contact.get("previous_title") or "(unknown)"
     header = f"*Existing contact updated — {district_name}*"
-    detail_lines = [
-        f"*Name:* {payload['name']}",
-        f"*Previous title:* {prev}",
-        f"*New title:* {payload.get('job_title') or '(unchanged)'}",
-    ]
-    if "email" in changes and payload.get("email"):
-        detail_lines.append(f"*Email →* `{payload['email']}`")
-    if "phone" in changes and payload.get("phone"):
-        detail_lines.append(f"*Phone →* `{payload['phone']}`")
-    if "role_category" in changes and payload.get("role_category_label"):
-        detail_lines.append(f"*Role category →* {payload['role_category_label']}")
+    intro = f"*Name:* {payload['name']}"
+    detail_body = "\n".join([intro, ""] + _build_update_detail_lines(contact))
 
     blocks: list[dict] = [
         _section(header),
-        _section("\n".join(detail_lines)),
+        _section(detail_body),
     ]
 
     make_poc_id: str | None = None

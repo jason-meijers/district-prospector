@@ -30,11 +30,14 @@ from app.config import (
     get_settings,
 )
 from app.database import (
+    cancel_pending_actions_for_slack_message_ts,
     claim_pending_action,
     get_pending_action,
+    make_create_name_key,
     mark_action_cancelled,
     mark_action_executed,
     mark_action_failed,
+    record_contact_review_skip,
 )
 from app.pipedrive import PipedriveClient
 
@@ -337,8 +340,45 @@ async def handle_slack_interaction(payload: dict) -> dict:
     value = action.get("value") or ""
 
     if action_id == "pending_action_skip":
-        _safely(mark_action_cancelled, value)
-        return _slack_replace(f":no_entry: Skipped by {user_label}.")
+        pending = get_pending_action(value)
+        if pending:
+            kind = pending.get("kind") or ""
+            payload_skip = pending.get("payload") or {}
+            org_id = pending.get("pipedrive_org_id")
+            pid = pending.get("pipedrive_person_id")
+            try:
+                if kind == "create_person":
+                    record_contact_review_skip(
+                        pipedrive_org_id=int(org_id) if org_id is not None else None,
+                        kind=kind,
+                        create_name_key=make_create_name_key(
+                            payload_skip.get("name"), payload_skip.get("job_title")
+                        ),
+                        skipped_by=user_label,
+                    )
+                elif org_id is not None:
+                    record_contact_review_skip(
+                        pipedrive_org_id=int(org_id),
+                        kind=kind,
+                        pipedrive_person_id=int(pid) if pid is not None else None,
+                        skipped_by=user_label,
+                    )
+            except Exception as e:
+                print(
+                    f"[slack_interact] record_contact_review_skip failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+            ts = pending.get("slack_message_ts")
+            if ts:
+                cancel_pending_actions_for_slack_message_ts(ts)
+            else:
+                mark_action_cancelled(value)
+        else:
+            mark_action_cancelled(value)
+        return _slack_replace(
+            f":point_right: Skipped — future runs will post *text only* for this case "
+            f"(no action buttons). · by {user_label}"
+        )
 
     if action_id != "pending_action_execute":
         return _slack_replace(f":warning: Unknown action `{action_id}`.")

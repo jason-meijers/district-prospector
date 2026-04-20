@@ -609,10 +609,25 @@ class ExtractionAgent:
                     changes.append("phone")
 
                 previous_title = existing.get("job_title") or ""
+                prev_e = (existing.get("email") or "").strip().lower() or None
+                prev_p = (existing.get("phone") or "").strip() or None
+                prev_rid = existing.get("role_category_id")
+                try:
+                    prev_rid = int(prev_rid) if prev_rid is not None else None
+                except (TypeError, ValueError):
+                    prev_rid = None
                 updated_contact = {
                     "name": c.get("name"),
                     "job_title": c.get("job_title") or previous_title,
                     "previous_title": previous_title,
+                    "previous_email": prev_e,
+                    "previous_phone": prev_p,
+                    "previous_role_category_id": prev_rid,
+                    "previous_role_category_label": (
+                        ROLE_CATEGORY_OPTIONS[prev_rid]
+                        if prev_rid in ROLE_CATEGORY_OPTIONS
+                        else (existing.get("role_category_label") or None)
+                    ),
                     "role_category_id": c.get("role_category_id"),
                     "role_category_label": c.get("role_category_label"),
                     "email": c.get("email"),

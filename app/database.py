@@ -505,6 +505,88 @@ def mark_action_cancelled(action_id: str) -> None:
     ).execute()
 
 
+def cancel_pending_actions_for_slack_message_ts(slack_message_ts: str | None) -> int:
+    """
+    Cancel every *pending* row tied to the same Slack thread message (primary
+    action + sibling buttons such as Make PoC).
+    """
+    if not slack_message_ts:
+        return 0
+    client = _get_client()
+    result = (
+        client.table("pending_actions")
+        .update({"status": "cancelled"})
+        .eq("slack_message_ts", slack_message_ts)
+        .eq("status", "pending")
+        .execute()
+    )
+    return len(result.data or [])
+
+
+def make_create_name_key(name: str | None, job_title: str | None) -> str:
+    """Stable key for proposed creates (no Pipedrive person id yet)."""
+    n = (name or "").strip().lower()
+    t = (job_title or "").strip().lower()
+    return f"{n}|{t}"
+
+
+def is_contact_review_skipped(
+    *,
+    pipedrive_org_id: int,
+    kind: str,
+    pipedrive_person_id: int | None = None,
+    create_name_key: str | None = None,
+) -> bool:
+    """Whether the user already dismissed this Block Kit prompt for a later run."""
+    if pipedrive_person_id is None and not create_name_key:
+        return False
+    client = _get_client()
+    q = (
+        client.table("contact_review_skips")
+        .select("id")
+        .eq("pipedrive_org_id", pipedrive_org_id)
+        .eq("kind", kind)
+        .limit(1)
+    )
+    if pipedrive_person_id is not None:
+        q = q.eq("pipedrive_person_id", pipedrive_person_id)
+    else:
+        q = q.eq("create_name_key", create_name_key or "")
+    result = q.execute()
+    return bool(result.data)
+
+
+def record_contact_review_skip(
+    *,
+    pipedrive_org_id: int | None,
+    kind: str,
+    pipedrive_person_id: int | None = None,
+    create_name_key: str | None = None,
+    skipped_by: str | None = None,
+) -> None:
+    """Persist a skip so future research runs post text-only (no buttons) for this case."""
+    if pipedrive_org_id is None:
+        return
+    if pipedrive_person_id is None and not create_name_key:
+        return
+    if is_contact_review_skipped(
+        pipedrive_org_id=pipedrive_org_id,
+        kind=kind,
+        pipedrive_person_id=pipedrive_person_id,
+        create_name_key=create_name_key,
+    ):
+        return
+    client = _get_client()
+    row: dict[str, Any] = {
+        "pipedrive_org_id": pipedrive_org_id,
+        "kind": kind,
+        "pipedrive_person_id": pipedrive_person_id,
+        "create_name_key": create_name_key,
+        "skipped_by": skipped_by,
+    }
+    client.table("contact_review_skips").insert(row).execute()
+
+
 def get_pending_action(action_id: str) -> dict | None:
     client = _get_client()
     result = (

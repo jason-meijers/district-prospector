@@ -259,6 +259,11 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
                 )
             except Exception as e:
                 print(f"[pipeline] Former-PoC deal list failed: {e}")
+            from app.database import (
+                attach_slack_message_to_action,
+                is_contact_review_skipped,
+                make_create_name_key,
+            )
 
         # Post confirmed contacts — no action required, text only works fine.
         for contact in confirmed:
@@ -269,8 +274,16 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         # Post updated contacts
         for contact in updated:
             if use_blocks and contact.get("pipedrive_person_id"):
+                if is_contact_review_skipped(
+                    pipedrive_org_id=org_id,
+                    kind="update_person",
+                    pipedrive_person_id=int(contact["pipedrive_person_id"]),
+                ):
+                    msg = slack.format_updated_contact(contact, date_str)
+                    await slack.post_thread(thread_ts, msg)
+                    await asyncio.sleep(delay)
+                    continue
                 try:
-                    from app.database import attach_slack_message_to_action
                     from app.slack_blocks import build_update_person_blocks
 
                     blocks, action_id, poc_id = build_update_person_blocks(
@@ -301,8 +314,18 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         # Post new contacts
         for contact in new:
             if use_blocks:
+                if is_contact_review_skipped(
+                    pipedrive_org_id=org_id,
+                    kind="create_person",
+                    create_name_key=make_create_name_key(
+                        contact.get("name"), contact.get("job_title")
+                    ),
+                ):
+                    msg = slack.format_new_contact(contact, org_id, date_str)
+                    await slack.post_thread(thread_ts, msg)
+                    await asyncio.sleep(delay)
+                    continue
                 try:
-                    from app.database import attach_slack_message_to_action
                     from app.slack_blocks import build_create_person_blocks
 
                     blocks, action_id, poc_id = build_create_person_blocks(
@@ -332,8 +355,16 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         # Post missing contacts (mark-former)
         for contact in missing:
             if use_blocks and contact.get("pipedrive_person_id"):
+                if is_contact_review_skipped(
+                    pipedrive_org_id=org_id,
+                    kind="mark_former",
+                    pipedrive_person_id=int(contact["pipedrive_person_id"]),
+                ):
+                    msg = slack.format_missing_contact(contact, website_url, date_str)
+                    await slack.post_thread(thread_ts, msg)
+                    await asyncio.sleep(delay)
+                    continue
                 try:
-                    from app.database import attach_slack_message_to_action
                     from app.slack_blocks import build_mark_former_blocks
 
                     blocks, action_id = build_mark_former_blocks(
