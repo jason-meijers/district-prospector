@@ -25,6 +25,7 @@ import httpx
 from app.config import (
     PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY,
     PIPEDRIVE_SALUTATION_FIELD_KEY,
+    ROLE_CATEGORY_BY_LABEL,
     SALUTATION_OPTIONS,
     get_settings,
 )
@@ -36,6 +37,35 @@ from app.database import (
     mark_action_failed,
 )
 from app.pipedrive import PipedriveClient
+
+FORMER_ROLE_CATEGORY_ID = int(ROLE_CATEGORY_BY_LABEL["Former"])
+
+
+def _slack_replace(text: str) -> dict[str, Any]:
+    """Interactive response: replace the message and remove Block Kit buttons."""
+    return {"replace_original": True, "text": text}
+
+
+async def _post_v1_note(
+    *,
+    person_id: int,
+    org_id: int | None,
+    content: str,
+) -> dict:
+    settings = get_settings()
+    pd_base = f"https://{settings.pipedrive_domain}/api/v1"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{pd_base}/notes",
+            params={"api_token": settings.pipedrive_api_token},
+            json={
+                "content": content,
+                "person_id": int(person_id),
+                "org_id": int(org_id) if org_id else None,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json().get("data") or {}
 
 
 # ── Signature verification ────────────────────────────────────────
@@ -124,7 +154,24 @@ async def _execute_create_person(action: dict) -> dict:
         resp.raise_for_status()
         person = resp.json().get("data") or {}
 
-    return {"pipedrive_person_id": person.get("id"), "name": clean_name}
+    pid = person.get("id")
+    note_meta: dict[str, Any] = {}
+    note_row = action.get("note_payload") or {}
+    note_content = (note_row.get("content") or "").strip()
+    if note_content and pid:
+        note = await _post_v1_note(
+            person_id=int(pid),
+            org_id=int(org_id) if org_id else None,
+            content=note_content,
+        )
+        note_meta = {"note_id": note.get("id"), "note_added": True}
+
+    out: dict[str, Any] = {
+        "pipedrive_person_id": pid,
+        "name": clean_name,
+        **note_meta,
+    }
+    return out
 
 
 async def _execute_update_person(action: dict) -> dict:
@@ -135,11 +182,19 @@ async def _execute_update_person(action: dict) -> dict:
         raise ValueError("update_person missing pipedrive_person_id")
 
     body: dict[str, Any] = {}
-    if payload.get("job_title"):
-        body["job_title"] = payload["job_title"]
     custom_fields: dict[str, Any] = {}
     if payload.get("role_category_id"):
         custom_fields[PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY] = int(payload["role_category_id"])
+
+    raw_name = (payload.get("name") or "").strip()
+    if raw_name:
+        clean_name, sal_id = _strip_salutation(raw_name)
+        body["name"] = clean_name
+        if sal_id:
+            custom_fields[PIPEDRIVE_SALUTATION_FIELD_KEY] = sal_id
+
+    if payload.get("job_title"):
+        body["job_title"] = payload["job_title"]
     if custom_fields:
         body["custom_fields"] = custom_fields
     if payload.get("email"):
@@ -164,9 +219,7 @@ async def _execute_update_person(action: dict) -> dict:
 
 async def _execute_mark_former(action: dict) -> dict:
     """
-    'Mark as former' is implemented as a note on the person plus a label/
-    custom-field bump. For now we just add a note; the exact field mapping
-    can evolve without touching the pending_actions contract.
+    Set Role Category to *Former* in Pipedrive (v2 PATCH), then add an audit note (v1).
     """
     settings = get_settings()
     payload = action.get("payload") or {}
@@ -174,6 +227,20 @@ async def _execute_mark_former(action: dict) -> dict:
     org_id = action.get("pipedrive_org_id")
     if not person_id:
         raise ValueError("mark_former missing pipedrive_person_id")
+
+    pd_v2 = f"https://{settings.pipedrive_domain}/api/v2"
+    patch_body = {
+        "custom_fields": {
+            PIPEDRIVE_ROLE_CATEGORY_FIELD_KEY: FORMER_ROLE_CATEGORY_ID,
+        }
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.patch(
+            f"{pd_v2}/persons/{int(person_id)}",
+            params={"api_token": settings.pipedrive_api_token},
+            json=patch_body,
+        )
+        resp.raise_for_status()
 
     content = (
         f"District Prospector flagged {payload.get('name') or 'this contact'} as "
@@ -185,21 +252,17 @@ async def _execute_mark_former(action: dict) -> dict:
     if payload.get("notes"):
         content += f" {payload['notes']}"
 
-    pd_base = f"https://{settings.pipedrive_domain}/api/v1"
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            f"{pd_base}/notes",
-            params={"api_token": settings.pipedrive_api_token},
-            json={
-                "content": content,
-                "person_id": int(person_id),
-                "org_id": int(org_id) if org_id else None,
-            },
-        )
-        resp.raise_for_status()
-        note = resp.json().get("data") or {}
+    note = await _post_v1_note(
+        person_id=int(person_id),
+        org_id=int(org_id) if org_id else None,
+        content=content,
+    )
 
-    return {"pipedrive_person_id": person_id, "note_id": note.get("id")}
+    return {
+        "pipedrive_person_id": person_id,
+        "role_category_id": FORMER_ROLE_CATEGORY_ID,
+        "note_id": note.get("id"),
+    }
 
 
 async def _execute_make_poc(action: dict) -> dict:
@@ -253,14 +316,15 @@ _EXECUTORS = {
 # ── Main dispatcher ────────────────────────────────────────────────
 
 
-async def handle_slack_interaction(payload: dict) -> dict | None:
+async def handle_slack_interaction(payload: dict) -> dict:
     """
-    Entry point for ``/slack/interact``. Returns a dict to post back to
-    Slack via ``response_url`` (or None if nothing needs to be said).
+    Entry point for ``/slack/interact``. Returns a dict for the HTTP response
+    and ``response_url`` (always ``replace_original`` so Block Kit buttons
+    are removed).
     """
     actions = payload.get("actions") or []
     if not actions:
-        return None
+        return _slack_replace(":warning: Unrecognized interaction (no actions in payload).")
 
     user = payload.get("user") or {}
     user_label = user.get("username") or user.get("id") or "unknown"
@@ -274,34 +338,27 @@ async def handle_slack_interaction(payload: dict) -> dict | None:
 
     if action_id == "pending_action_skip":
         _safely(mark_action_cancelled, value)
-        return {
-            "replace_original": True,
-            "text": f":no_entry: Skipped by {user_label}.",
-        }
+        return _slack_replace(f":no_entry: Skipped by {user_label}.")
 
     if action_id != "pending_action_execute":
-        return {
-            "text": f":warning: Unknown action `{action_id}`.",
-        }
+        return _slack_replace(f":warning: Unknown action `{action_id}`.")
 
     pending = get_pending_action(value)
     if not pending:
-        return {"text": f":x: Action `{value}` not found."}
+        return _slack_replace(f":x: Action `{value}` not found.")
 
     claimed = claim_pending_action(value, claimed_by=user_label)
     if not claimed:
         current = pending.get("status")
-        return {
-            "text": (
-                f":hourglass: Already `{current}` — ignoring duplicate click."
-            ),
-        }
+        return _slack_replace(
+            f":hourglass: Already `{current}` — ignoring duplicate click."
+        )
 
     kind = claimed.get("kind") or ""
     executor = _EXECUTORS.get(kind)
     if not executor:
         mark_action_failed(value, f"no executor for kind {kind!r}")
-        return {"text": f":x: No executor registered for `{kind}`."}
+        return _slack_replace(f":x: No executor registered for `{kind}`.")
 
     try:
         result = await executor(claimed)
@@ -312,10 +369,7 @@ async def handle_slack_interaction(payload: dict) -> dict | None:
         mark_action_failed(value, err)
         summary = f":x: Failed: `{err}`"
 
-    outgoing = {
-        "replace_original": True,
-        "text": summary,
-    }
+    outgoing = _slack_replace(summary)
     if response_url:
         # Fire-and-forget post back to Slack so the message updates inline.
         try:
@@ -337,14 +391,23 @@ def _format_success(kind: str, result: dict, user_label: str) -> str:
     if kind == "create_person":
         pid = result.get("pipedrive_person_id")
         name = result.get("name") or "contact"
-        return f":white_check_mark: Created *{name}* in Pipedrive (person `{pid}`) · by {user_label}"
+        extra = ""
+        if result.get("note_added"):
+            extra = " · extraction note attached"
+        return (
+            f":white_check_mark: Created *{name}* in Pipedrive (person `{pid}`)"
+            f"{extra} · by {user_label}"
+        )
     if kind == "update_person":
         pid = result.get("pipedrive_person_id")
         fields = ", ".join(result.get("fields_updated") or []) or "(none)"
         return f":white_check_mark: Updated person `{pid}` ({fields}) · by {user_label}"
     if kind == "mark_former":
         pid = result.get("pipedrive_person_id")
-        return f":white_check_mark: Flagged person `{pid}` as former · by {user_label}"
+        return (
+            f":white_check_mark: Set Role Category to *Former* for person `{pid}` "
+            f"(audit note added) · by {user_label}"
+        )
     if kind == "make_poc":
         pid = result.get("pipedrive_person_id")
         deals = result.get("deals_updated") or []

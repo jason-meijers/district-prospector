@@ -539,7 +539,13 @@ async def slack_interact(request: Request):
     # Slack expects 200 within 3s even when we've already posted via
     # response_url; returning the same body lets clients that don't honour
     # response_url (e.g. curl-based test harnesses) see the outcome too.
-    return JSONResponse(response or {"text": "ok"})
+    return JSONResponse(
+        response
+        or {
+            "replace_original": True,
+            "text": ":warning: Slack interaction returned no response body.",
+        }
+    )
 
 
 @app.post("/webhook/pipedrive")
