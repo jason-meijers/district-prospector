@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS public.contact_review_skips (
         'create_person',
         'update_person',
         'mark_former',
-        'make_poc'
+        'make_poc',
+        'new_contact_not_target_role'
     ])),
     create_name_key text,
     skipped_by text,
@@ -20,9 +21,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS contact_review_skips_org_person_kind_uidx
     ON public.contact_review_skips (pipedrive_org_id, pipedrive_person_id, kind)
     WHERE pipedrive_person_id IS NOT NULL;
 
--- Proposed creates have no person id — key by normalized name|title within org.
-CREATE UNIQUE INDEX IF NOT EXISTS contact_review_skips_org_create_key_uidx
-    ON public.contact_review_skips (pipedrive_org_id, create_name_key)
+-- Proposed creates have no person id — key by normalized name|title + kind within org.
+CREATE UNIQUE INDEX IF NOT EXISTS contact_review_skips_org_create_key_kind_uidx
+    ON public.contact_review_skips (pipedrive_org_id, create_name_key, kind)
     WHERE create_name_key IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS contact_review_skips_org_idx

@@ -558,6 +558,40 @@ def _note_skips_table_missing() -> None:
         )
 
 
+def is_proposed_create_suppressed(
+    *,
+    pipedrive_org_id: int,
+    create_name_key: str,
+) -> bool:
+    """
+    True if this proposed new contact should not appear in Slack (generic skip
+    or “not a target role”).
+    """
+    if _skips_table_unavailable:
+        return False
+    key = (create_name_key or "").strip()
+    if not key or key == "|":
+        return False
+    try:
+        client = _get_client()
+        result = (
+            client.table("contact_review_skips")
+            .select("id")
+            .eq("pipedrive_org_id", pipedrive_org_id)
+            .eq("create_name_key", key)
+            .in_("kind", ["create_person", "new_contact_not_target_role"])
+            .limit(1)
+            .execute()
+        )
+        return bool(result.data)
+    except Exception as e:
+        if _contact_review_skips_table_error(e):
+            _note_skips_table_missing()
+            return False
+        print(f"[database] is_proposed_create_suppressed failed: {type(e).__name__}: {e}")
+        return False
+
+
 def is_contact_review_skipped(
     *,
     pipedrive_org_id: int,

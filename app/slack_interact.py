@@ -380,6 +380,37 @@ async def handle_slack_interaction(payload: dict) -> dict:
             f"(no action buttons). · by {user_label}"
         )
 
+    if action_id == "pending_action_dismiss_not_target_role":
+        pending = get_pending_action(value)
+        if pending and pending.get("kind") == "create_person":
+            payload_d = pending.get("payload") or {}
+            org_id = pending.get("pipedrive_org_id")
+            try:
+                record_contact_review_skip(
+                    pipedrive_org_id=int(org_id) if org_id is not None else None,
+                    kind="new_contact_not_target_role",
+                    create_name_key=make_create_name_key(
+                        payload_d.get("name"), payload_d.get("job_title")
+                    ),
+                    skipped_by=user_label,
+                )
+            except Exception as e:
+                print(
+                    f"[slack_interact] record_contact_review_skip (not_target_role) failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+            ts = pending.get("slack_message_ts")
+            if ts:
+                cancel_pending_actions_for_slack_message_ts(ts)
+            else:
+                mark_action_cancelled(value)
+        else:
+            mark_action_cancelled(value)
+        return _slack_replace(
+            f":white_check_mark: Marked as *not a target role* — we will not suggest "
+            f"this person in Slack for this district again. · by {user_label}"
+        )
+
     if action_id != "pending_action_execute":
         return _slack_replace(f":warning: Unknown action `{action_id}`.")
 

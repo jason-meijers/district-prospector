@@ -209,6 +209,17 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
         new = contacts.get("new", [])
         missing = contacts.get("missing", [])
 
+        from app.database import is_proposed_create_suppressed, make_create_name_key
+
+        new = [
+            c
+            for c in new
+            if not is_proposed_create_suppressed(
+                pipedrive_org_id=org_id,
+                create_name_key=make_create_name_key(c.get("name"), c.get("job_title")),
+            )
+        ]
+
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         # Parent message
@@ -262,7 +273,6 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
             from app.database import (
                 attach_slack_message_to_action,
                 is_contact_review_skipped,
-                make_create_name_key,
             )
 
         # Post confirmed contacts — no action required, text only works fine.
@@ -311,20 +321,9 @@ async def run_research_pipeline(org_id: int, website_override: str | None = None
                 await slack.post_thread(thread_ts, msg)
             await asyncio.sleep(delay)
 
-        # Post new contacts
+        # Post new contacts (pre-filtered: generic skip + “not a target role”)
         for contact in new:
             if use_blocks:
-                if is_contact_review_skipped(
-                    pipedrive_org_id=org_id,
-                    kind="create_person",
-                    create_name_key=make_create_name_key(
-                        contact.get("name"), contact.get("job_title")
-                    ),
-                ):
-                    msg = slack.format_new_contact(contact, org_id, date_str)
-                    await slack.post_thread(thread_ts, msg)
-                    await asyncio.sleep(delay)
-                    continue
                 try:
                     from app.slack_blocks import build_create_person_blocks
 

@@ -129,6 +129,7 @@ def _action_buttons(
     *,
     primary_style: str = "primary",
     include_cancel_value: str | None = None,
+    include_dismiss_not_target_value: str | None = None,
     confirm: dict | None = None,
 ) -> dict:
     elements: list[dict] = [
@@ -149,6 +150,24 @@ def _action_buttons(
                 "text": {"type": "plain_text", "text": "Skip"},
                 "action_id": "pending_action_skip",
                 "value": include_cancel_value,
+            }
+        )
+    if include_dismiss_not_target_value:
+        dismiss_confirm = _confirm_dialog(
+            title="Not a target role?",
+            body=(
+                "We will stop suggesting this person in Slack for this district "
+                "(same name + title). You can still add them in Pipedrive manually."
+            ),
+            ok="Yes, dismiss",
+        )
+        elements.append(
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Not a target role"},
+                "action_id": "pending_action_dismiss_not_target_role",
+                "value": include_dismiss_not_target_value,
+                "confirm": dismiss_confirm,
             }
         )
     return {"type": "actions", "elements": elements}
@@ -246,6 +265,7 @@ def build_create_person_blocks(
             primary_label="Create in Pipedrive",
             primary_value=action_id,
             include_cancel_value=action_id,
+            include_dismiss_not_target_value=action_id,
         )
     )
     if make_poc_id:
