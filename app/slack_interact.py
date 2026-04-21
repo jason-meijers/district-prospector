@@ -50,6 +50,17 @@ def _slack_replace(text: str) -> dict[str, Any]:
     return {"replace_original": True, "text": text}
 
 
+async def _post_response_url(response_url: str | None, outgoing: dict[str, Any]) -> None:
+    """Notify Slack so the original message updates (Block Kit often needs this, not only the 200 JSON)."""
+    if not response_url:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            await client.post(response_url, json=outgoing)
+    except Exception as e:
+        print(f"[slack_interact] response_url POST failed: {type(e).__name__}: {e}")
+
+
 async def _post_v1_note(
     *,
     person_id: int,
@@ -363,13 +374,17 @@ async def handle_slack_interaction(payload: dict) -> dict:
     and ``response_url`` (always ``replace_original`` so Block Kit buttons
     are removed).
     """
+    response_url = payload.get("response_url")
     actions = payload.get("actions") or []
     if not actions:
-        return _slack_replace(":warning: Unrecognized interaction (no actions in payload).")
+        outgoing = _slack_replace(
+            ":warning: Unrecognized interaction (no actions in payload)."
+        )
+        await _post_response_url(response_url, outgoing)
+        return outgoing
 
     user = payload.get("user") or {}
     user_label = user.get("username") or user.get("id") or "unknown"
-    response_url = payload.get("response_url")
 
     # One interactive message triggers one action at a time in practice; we
     # handle the first and ignore the rest to keep the response simple.
@@ -413,10 +428,12 @@ async def handle_slack_interaction(payload: dict) -> dict:
                 mark_action_cancelled(value)
         else:
             mark_action_cancelled(value)
-        return _slack_replace(
+        outgoing = _slack_replace(
             f":point_right: Skipped — future runs will post *text only* for this case "
             f"(no action buttons). · by {user_label}"
         )
+        await _post_response_url(response_url, outgoing)
+        return outgoing
 
     if action_id == "pending_action_dismiss_not_target_role":
         pending = get_pending_action(value)
@@ -444,30 +461,40 @@ async def handle_slack_interaction(payload: dict) -> dict:
                 mark_action_cancelled(value)
         else:
             mark_action_cancelled(value)
-        return _slack_replace(
+        outgoing = _slack_replace(
             f":point_right: Not a target role — future runs will post *text only* for this "
             f"contact. · by {user_label}"
         )
+        await _post_response_url(response_url, outgoing)
+        return outgoing
 
     if action_id != "pending_action_execute":
-        return _slack_replace(f":warning: Unknown action `{action_id}`.")
+        outgoing = _slack_replace(f":warning: Unknown action `{action_id}`.")
+        await _post_response_url(response_url, outgoing)
+        return outgoing
 
     pending = get_pending_action(value)
     if not pending:
-        return _slack_replace(f":x: Action `{value}` not found.")
+        outgoing = _slack_replace(f":x: Action `{value}` not found.")
+        await _post_response_url(response_url, outgoing)
+        return outgoing
 
     claimed = claim_pending_action(value, claimed_by=user_label)
     if not claimed:
         current = pending.get("status")
-        return _slack_replace(
+        outgoing = _slack_replace(
             f":hourglass: Already `{current}` — ignoring duplicate click."
         )
+        await _post_response_url(response_url, outgoing)
+        return outgoing
 
     kind = claimed.get("kind") or ""
     executor = _EXECUTORS.get(kind)
     if not executor:
         mark_action_failed(value, f"no executor for kind {kind!r}")
-        return _slack_replace(f":x: No executor registered for `{kind}`.")
+        outgoing = _slack_replace(f":x: No executor registered for `{kind}`.")
+        await _post_response_url(response_url, outgoing)
+        return outgoing
 
     try:
         result = await executor(claimed)
@@ -486,13 +513,7 @@ async def handle_slack_interaction(payload: dict) -> dict:
         summary = f":x: Failed: `{err}`"
 
     outgoing = _slack_replace(summary)
-    if response_url:
-        # Fire-and-forget post back to Slack so the message updates inline.
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                await client.post(response_url, json=outgoing)
-        except Exception as e:
-            print(f"[slack_interact] response_url POST failed: {type(e).__name__}: {e}")
+    await _post_response_url(response_url, outgoing)
     return outgoing
 
 
