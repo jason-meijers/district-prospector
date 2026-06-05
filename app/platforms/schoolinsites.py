@@ -17,6 +17,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.platforms import PlatformAdapter, PlatformDetection, PlatformPage, register
+from app.role_filters import is_obviously_non_target_roster_title
 
 
 _USER_AGENT = (
@@ -101,10 +102,20 @@ class SchoolInsitesAdapter:
                     f"[platforms.schoolinsites] widget {widget_id} returned "
                     f"{len(data)} entries"
                 )
+                dropped = 0
                 for person in data:
+                    title = (person.get("JobTitle") or "").strip()
+                    if is_obviously_non_target_roster_title(title):
+                        dropped += 1
+                        continue
                     line = _format_person(person)
                     if line:
                         all_lines.append(line)
+                if dropped:
+                    print(
+                        f"[platforms.schoolinsites] widget {widget_id} dropped "
+                        f"{dropped} non-target titles"
+                    )
 
         if not all_lines:
             return []

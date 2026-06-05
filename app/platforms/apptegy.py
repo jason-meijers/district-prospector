@@ -45,6 +45,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.platforms import PlatformAdapter, PlatformDetection, PlatformPage, register
+from app.role_filters import is_obviously_non_target_roster_title
 
 
 _BROWSER_UA = (
@@ -142,15 +143,25 @@ class ApptegyAdapter:
         if not people:
             return []
 
-        lines = [_format_person(p) for p in people]
-        lines = [line for line in lines if line]
-        if not lines:
+        kept: list[str] = []
+        dropped = 0
+        for person in people:
+            title = (person.get("title") or "").strip()
+            if is_obviously_non_target_roster_title(title):
+                dropped += 1
+                continue
+            line = _format_person(person)
+            if line:
+                kept.append(line)
+        if not kept:
             return []
 
         print(
             f"[platforms.apptegy] {base_url} via {staff_api_url} — "
-            f"{len(lines)} staff entries"
+            f"{len(kept)} staff entries"
+            + (f" (dropped {dropped} non-target titles)" if dropped else "")
         )
+        lines = kept
         content = "## Staff Directory (via Apptegy/Thrillshare API)\n" + "\n".join(lines)
         return [
             PlatformPage(

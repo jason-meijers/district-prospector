@@ -8,6 +8,7 @@ from app.batch_agent import BatchExtractionAgent
 from app.config import ROLE_CATEGORY_OPTIONS, get_settings
 from app.firecrawl_scraper import scrape_district
 from app.role_coverage import cohort_labels, score_role_coverage
+from app.role_filters import is_target_extracted_contact
 from app.text_sanitize import sanitize_contact_dict
 
 
@@ -93,6 +94,8 @@ def reconcile_extracted_contacts(
         c = sanitize_contact_dict(dict(raw))
         name = (c.get("name") or "").strip()
         if not name:
+            continue
+        if not is_target_extracted_contact(c):
             continue
         norm_name = _norm_name(name)
 

@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import anthropic
 from app.config import get_settings
 from app.json_llm import parse_llm_json_object
+from app.role_filters import is_target_extracted_contact
 
 # ─────────────────────────────────────────────────────────────
 # Role options passed directly into the prompt so Claude
@@ -463,7 +464,11 @@ def _classify_page_type(url: str, content: str, website_url: str | None) -> str:
     u = (url or "").strip()
     lower_url = u.lower()
 
-    if "[schoolinsites api]" in lower_url or "[platform api]" in lower_url:
+    if (
+        "[schoolinsites api]" in lower_url
+        or "[platform api]" in lower_url
+        or "[apptegy api]" in lower_url
+    ):
         return "platform_api"
 
     if website_url:
@@ -839,6 +844,13 @@ class BatchExtractionAgent:
             name_lower = name.lower()
             if any(word in name_lower for word in _LABEL_WORDS):
                 print(f"[batch_agent] Skipping UI label as name: '{name}'")
+                continue
+            if not is_target_extracted_contact(c):
+                title = (c.get("job_title") or "").strip()
+                print(
+                    f"[batch_agent] Skipping non-target role: '{name}'"
+                    + (f" ({title})" if title else "")
+                )
                 continue
             clean_contacts.append(c)
 
