@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     # Agent (existing webhook flow)
     max_subpages: int = 7
     max_directory_pages: int = 2  # extra pagination pages to fetch per staff-directory-like URL
-    claude_model: str = "claude-sonnet-4-20250514"
+    claude_model: str = "claude-sonnet-4-6"
     pipedrive_use_batch_pipeline: bool = False
 
     # Optional: require this secret on /webhook/pipedrive (header X-Webhook-Secret or query ?secret=)
@@ -163,7 +163,7 @@ class Settings(BaseSettings):
     hunter_max_tool_calls_full: int = 15
     hunter_max_output_tokens: int = 60_000
     hunter_max_seconds: int = 180
-    hunter_model: str = "claude-sonnet-4-20250514"
+    hunter_model: str = "claude-sonnet-4-6"
 
     # ── Platform adapters ───────────────────────────────────────
     # When an adapter reports a detection score ≥ this threshold, its
